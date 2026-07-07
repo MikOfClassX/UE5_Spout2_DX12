@@ -57,7 +57,8 @@ Build/*
 Build/*/**
 !Build/*/PakBlacklist*.txt
 
-# CMake inspection-only project (CMakeLists.txt) local configure output
+# CMake inspection-only project -- local-only, not shared via git
+CMakeLists.txt
 build/
 build-*/
 out/
