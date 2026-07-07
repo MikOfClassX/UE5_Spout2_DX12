@@ -14,6 +14,9 @@
 #include "RHICommandList.h"
 #include "Rendering/SlateRenderer.h"
 #include "TextureResource.h"
+#include "TimerManager.h"
+#include "PipelineStateCache.h"
+#include "ShaderPipelineCache.h"
 #include "Logging/LogMacros.h"
 #include "UObject/UnrealType.h"
 #include "UObject/UObjectIterator.h"
@@ -1014,6 +1017,17 @@ void USpoutSenderComponent::StopBroadcastInternal(bool bClearConfiguration, bool
 {
     const bool bWasGameViewportSource = IsUsingGameViewportSource();
 
+    // Cancel any deferred-start retry still in flight (see
+    // StartBroadcastConfigured). Without this, stopping the sender while a
+    // start is being held back would leave an armed timer that restarts
+    // the broadcast on its own up to 0.5 s later. Also reset the one-shot
+    // log flag so a future deferral logs its "holding start" line again.
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(StartDelayTimerHandle);
+    }
+    bLoggedStartDeferral = false;
+
     bIsBroadcasting = false;
     SetComponentTickEnabled(false);
     SetComponentTickInterval(0.0f);
@@ -1758,6 +1772,112 @@ void USpoutSenderComponent::StartBroadcastConfigured(
 #if PLATFORM_WINDOWS
     bWantsBroadcasting = true;
     bBroadcastIntentInitialized = true;
+
+    // ------------------------------------------------------------------
+    // DEFERRED START — fix for the headless GPU hang (see the full story
+    // next to StartDelaySeconds in SpoutSenderComponent.h).
+    //
+    // Opening the D3D11On12 bridge and submitting interop work while the
+    // engine is still rendering its first frames or compiling startup PSOs
+    // can deadlock the D3D12 queue when no swapchain exists
+    // (-RenderOffScreen): the GPU crash dumps always showed the 3D queue
+    // stuck at Frame 0. Hold the real start until a minimum world time has
+    // passed AND PSO precaching is idle, so heavier scenes wait as long as
+    // they need. MaxStartDelaySeconds caps the wait as a safety valve.
+    // ------------------------------------------------------------------
+
+    // il fix lavora solo su quando è attivo in modalità game non editor
+    UWorld* World = GetWorld();
+    if (World && World->IsGameWorld() && StartDelaySeconds > 0.0f)
+    {
+		// tempo trascorso dall'inizio del livello
+        const float WorldSeconds = static_cast<float>(World->GetTimeSeconds());
+
+        // Verifica se è passato il tempo minimo di "grazia" impostato per lasciare che il motore si scaldi.
+        const bool bMinTimePassed = WorldSeconds >= StartDelaySeconds;
+
+		// Conta quanti shader sono ancora in fase di compilazione. Questa è la causa principale del blocco: se il motore sta compilando, la coda della GPU è satura.
+        const int32 PendingPSOs =
+            static_cast<int32>(PipelineStateCache::NumActivePrecacheRequests()) +
+            static_cast<int32>(FShaderPipelineCache::NumPrecompilesRemaining());
+
+		// bForcedStart: Definisce un "limite massimo". Se il tempo totale trascorso supera questa soglia, 
+		// forziamo l'avvio anche se ci sono ancora shader in coda. Serve a evitare che il sender non parta mai a causa di una scena troppo pesante.
+        const bool bForcedStart = MaxStartDelaySeconds > 0.0f && WorldSeconds >= MaxStartDelaySeconds;
+
+        // Se non siamo oltre il tempo massimo E (non è passato il tempo minimo O ci sono ancora shader in attesa), allora entriamo nel blocco di attesa.
+        if (!bForcedStart && (!bMinTimePassed || PendingPSOs > 0))
+        {
+			// Salva i parametri di configurazione in variabili membro. Poiché il retry richiamerà StartBroadcast senza argomenti, dobbiamo conservare qui i dati configurati dall'utente.
+            CurrentRenderTarget = (SourceType == ESpoutSenderSourceType::RenderTarget) ? RenderTarget : nullptr;
+            CurrentSenderName = SenderName;
+            BroadcastFPS = FPS;
+
+            // Se siamo nel periodo di grazia: aspetta quanto manca alla scadenza. 
+		    // Se il tempo è passato ma attendiamo i PSO: attendi 0,5 secondi (polling).
+            const float RetryDelay = bMinTimePassed
+                ? 0.5f
+                : FMath::Max(StartDelaySeconds - WorldSeconds, 0.1f);
+
+			// SetTimer: Imposta un timer "one-shot" che richiamerà StartBroadcast in futuro. 
+			// Questo "mette in pausa" l'inizializzazione senza bloccare il thread principale (niente Sleep che bloccherebbe il gioco).
+            World->GetTimerManager().SetTimer(
+                StartDelayTimerHandle,
+                this,
+                &USpoutSenderComponent::StartBroadcast,
+                RetryDelay,
+                false);
+
+            // Log the deferral once per cycle, not on every 0.5 s retry.
+            if (!bLoggedStartDeferral)
+            {
+                bLoggedStartDeferral = true;
+                UE_LOG(
+                    LogSpoutSender,
+                    Display,
+                    TEXT("StartBroadcastConfigured: Holding sender start (world time %.2fs, min %.2fs, pending PSO precompiles %d, cap %.2fs). %s"),
+                    WorldSeconds,
+                    StartDelaySeconds,
+                    PendingPSOs,
+                    MaxStartDelaySeconds,
+                    *BuildSenderDebugContext(this));
+            }
+            // Bail out WITHOUT opening the Spout bridge; the timer above
+            // will bring us back here.
+            return;
+        }
+
+        // Reaching this point means the deferred start is going through.
+        // If we ever deferred, close the log cycle by saying HOW we are
+        // starting — this is what tells you in the packaged log whether
+        // the fix behaved:
+        //  - Warning: the cap expired with PSOs still compiling (start is
+        //    forced; if crashes ever come back, raise MaxStartDelaySeconds);
+        //  - Display: PSO precaching drained normally, clean start.
+        if (bLoggedStartDeferral)
+        {
+            bLoggedStartDeferral = false;
+            if (bForcedStart && PendingPSOs > 0)
+            {
+                UE_LOG(
+                    LogSpoutSender,
+                    Warning,
+                    TEXT("StartBroadcastConfigured: Deferred start forced by MaxStartDelaySeconds at world time %.2fs with %d PSO precompiles still pending. %s"),
+                    WorldSeconds,
+                    PendingPSOs,
+                    *BuildSenderDebugContext(this));
+            }
+            else
+            {
+                UE_LOG(
+                    LogSpoutSender,
+                    Display,
+                    TEXT("StartBroadcastConfigured: Deferred start proceeding at world time %.2fs (PSO precaching idle). %s"),
+                    WorldSeconds,
+                    *BuildSenderDebugContext(this));
+            }
+        }
+    }
 
     if (bIsBroadcasting)
     {

@@ -57,6 +57,19 @@ Build/*
 Build/*/**
 !Build/*/PakBlacklist*.txt
 
+# CMake inspection-only project (CMakeLists.txt) local configure output
+build/
+build-*/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
 # Don't ignore icon files in Build
 !Build/**/*.ico
 

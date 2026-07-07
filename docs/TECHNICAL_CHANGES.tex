@@ -1,0 +1,425 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{titling}
+
+\definecolor{codebg}{rgb}{0.95,0.95,0.95}
+\definecolor{codecomment}{rgb}{0.35,0.45,0.35}
+\definecolor{codekeyword}{rgb}{0.05,0.15,0.55}
+
+\lstdefinestyle{cpp}{
+    language=C++,
+    backgroundcolor=\color{codebg},
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{codekeyword}\bfseries,
+    commentstyle=\color{codecomment}\itshape,
+    stringstyle=\color{purple},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    breaklines=true,
+    frame=single,
+    tabsize=4,
+    showstringspaces=false
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue
+}
+
+\title{\textbf{UE5\_Spout2\_DX12} \\ \large Technical Changes vs.\ the Original Repository}
+\author{Internal engineering note}
+\date{2026-07-07}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This document describes, at a technical level, every modification applied
+to the \texttt{Spout2\_DX12} plugin on top of the base version tracked in
+\texttt{origin/main} (commit \texttt{37e714e}, ``Readme update and hot fix
+for viewport sender'' lineage). The changes were developed and validated in
+a separate working copy of the plugin embedded in an Unreal Engine 5.8
+project, then ported back into this repository. They fall into four
+categories: a GPU-hang fix for headless (\texttt{-RenderOffScreen})
+sessions, a Shipping-build shutdown crash fix, a receiver-side
+frame-synchronization fix, and a linker fix for the third-party Spout
+libraries. A command-line build script was also added.
+\end{abstract}
+
+\tableofcontents
+
+\section{Scope and Baseline}
+
+\begin{itemize}
+    \item \textbf{Baseline}: commit \texttt{37e714e} (source-identical to
+        \texttt{baf099f}, which only touches \texttt{README.md}).
+    \item \textbf{Files touched}: 7 source files, 476 insertions / 9
+        deletions.
+    \begin{itemize}[nosep]
+        \item \texttt{Source/Spout2\_DX12/Private/Spout2\_DX12.cpp}
+        \item \texttt{Source/Spout2\_DX12/Private/SpoutReceiverComponent.cpp}
+        \item \texttt{Source/Spout2\_DX12/Private/SpoutSenderComponent.cpp}
+        \item \texttt{Source/Spout2\_DX12/Public/Spout2\_DX12.h}
+        \item \texttt{Source/Spout2\_DX12/Public/SpoutReceiverComponent.h}
+        \item \texttt{Source/Spout2\_DX12/Public/SpoutSenderComponent.h}
+        \item \texttt{Source/Spout2\_DX12/Spout2\_DX12.Build.cs}
+    \end{itemize}
+    \item \textbf{Binaries}: not carried over as-is; recompiled against
+        this repository's copy of the source via the new \texttt{Build.bat}
+        (Section~\ref{sec:build}), verified to produce a successful
+        Editor / Game Development / Game Shipping build for Win64 against
+        UE~5.8.
+\end{itemize}
+
+\section{Fix 1 --- Deferred Bridge Start (Headless GPU Hang)}
+\label{sec:deferred-start}
+
+\subsection{Symptom}
+In windowless sessions launched with \texttt{-RenderOffScreen}, the process
+intermittently hung with \texttt{DXGI\_ERROR\_DEVICE\_HUNG} on the D3D12
+graphics queue, with GPU crash-dump breadcrumbs consistently stuck at
+\emph{Frame~0}. The failure rate observed during validation was
+approximately 3 out of 4 runs before the fix, 0 out of 4 after.
+
+\subsection{Root Cause}
+Both \texttt{USpoutSenderComponent} and \texttt{USpoutReceiverComponent}
+open a \texttt{D3D11On12} interop bridge (via \texttt{spoutDX12}) to share
+textures with other Spout-aware processes. This bridge submits interop
+work on the same D3D12 queue the engine uses for rendering. In a normal
+windowed session, the swapchain's \texttt{Present} call implicitly paces
+that queue every frame. In a windowless session there is no swapchain, so
+nothing paces the queue during the engine's startup phase --- which is also
+when the Pipeline State Object (PSO) precompilation flood happens (map
+load, first-frame shader compiles). Opening the interop bridge and
+submitting work while that flood is in flight was racing the queue and
+deadlocking it.
+
+\subsection{Fix Design}
+The actual bridge initialization in both components is now held behind two
+conditions, checked at the top of \texttt{StartBroadcastConfigured()} (sender)
+and \texttt{StartReceiving()} (receiver):
+
+\begin{enumerate}
+    \item \textbf{Minimum grace period}: world time must have reached
+        \texttt{StartDelaySeconds} (a new \texttt{UPROPERTY}, default
+        \texttt{2.0f}; \texttt{0.0f} disables the whole mechanism and
+        restores pre-fix immediate-start behavior).
+    \item \textbf{PSO precaching idle}: both
+        \texttt{PipelineStateCache::NumActivePrecacheRequests()} and
+        \texttt{FShaderPipelineCache::NumPrecompilesRemaining()} must be
+        zero.
+\end{enumerate}
+
+A hard cap, \texttt{MaxStartDelaySeconds} (new \texttt{UPROPERTY}, default
+\texttt{15.0f}; \texttt{0.0f} = no cap), forces the start even if PSOs are
+still compiling once world time exceeds it --- this is a safety valve so a
+scene with a pathologically long shader-compile tail cannot hold the
+sender/receiver back indefinitely.
+
+While deferred, a one-shot \texttt{FTimerHandle}
+(\texttt{StartDelayTimerHandle}) re-invokes the same entry point after a
+retry delay: the remaining grace-period time if still inside it, otherwise
+a fixed \texttt{0.5\,s} poll interval. The mechanism only engages in an
+actual game world (\texttt{World->IsGameWorld()}); the editor/PIE path is
+unaffected because a window's \texttt{Present} already paces the queue
+there.
+
+\begin{lstlisting}[style=cpp,caption={Deferred-start gate (sender), abridged}]
+UWorld* World = GetWorld();
+if (World && World->IsGameWorld() && StartDelaySeconds > 0.0f)
+{
+    const float WorldSeconds = static_cast<float>(World->GetTimeSeconds());
+    const bool bMinTimePassed = WorldSeconds >= StartDelaySeconds;
+
+    const int32 PendingPSOs =
+        static_cast<int32>(PipelineStateCache::NumActivePrecacheRequests()) +
+        static_cast<int32>(FShaderPipelineCache::NumPrecompilesRemaining());
+
+    const bool bForcedStart =
+        MaxStartDelaySeconds > 0.0f && WorldSeconds >= MaxStartDelaySeconds;
+
+    if (!bForcedStart && (!bMinTimePassed || PendingPSOs > 0))
+    {
+        // stash config, arm a retry timer, bail out without
+        // opening the D3D11On12 bridge
+        return;
+    }
+    // otherwise: proceed with the real bridge initialization
+}
+\end{lstlisting}
+
+\subsection{Lifecycle Cleanup}
+\texttt{StopBroadcastInternal()} / \texttt{StopReceivingInternal()} now
+explicitly clear \texttt{StartDelayTimerHandle} via
+\texttt{World->GetTimerManager().ClearTimer(...)}. Without this, stopping
+the sender/receiver while a start was deferred would leave an armed timer
+that silently restarted the broadcast/receive path up to \texttt{0.5\,s}
+later, independent of the explicit stop. A companion flag,
+\texttt{bLoggedStartDeferral}, throttles the ``holding start'' log line to
+once per deferral cycle instead of once per \texttt{0.5\,s} retry, and is
+reset on stop so a future deferral logs again.
+
+\subsection{Files and Symbols}
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+File & New symbols \\
+\midrule
+\texttt{SpoutSenderComponent.h} & \texttt{StartDelaySeconds},
+    \texttt{MaxStartDelaySeconds}, \texttt{StartDelayTimerHandle},
+    \texttt{bLoggedStartDeferral} \\
+\texttt{SpoutSenderComponent.cpp} & gate in
+    \texttt{StartBroadcastConfigured()}; cleanup in
+    \texttt{StopBroadcastInternal()} \\
+\texttt{SpoutReceiverComponent.h} & same four symbols (independent
+    per-component state) \\
+\texttt{SpoutReceiverComponent.cpp} & gate in \texttt{StartReceiving()};
+    cleanup in \texttt{StopReceivingInternal()} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Fix 2 --- Shipping Shutdown Crash}
+\label{sec:shutdown-crash}
+
+\subsection{Symptom}
+Access violation observed during process teardown in monolithic Shipping
+builds.
+
+\subsection{Root Cause}
+\texttt{FSpout2\_DX12Module::ShutdownModule()} used to call
+\texttt{FPlatformProcess::FreeDllHandle(MyDllHandle)} to explicitly unload
+\texttt{SpoutDX12.dll}. In monolithic Shipping builds, static destructors
+running \emph{after} module shutdown can still call into that DLL; once
+it has been unloaded, that call lands on unmapped memory.
+
+\subsection{Fix}
+The explicit \texttt{FreeDllHandle} call was removed;
+\texttt{MyDllHandle} is simply reset to \texttt{nullptr} as a bookkeeping
+value. The DLL is left mapped for the remaining lifetime of the process ---
+harmless, since the OS reclaims all module handles unconditionally at
+process exit. This trades an unnecessary explicit unload for guaranteed
+safety against late static-destructor calls.
+
+\section{Fix 3 --- Graceful Stop Channel for Headless Sessions}
+\label{sec:stop-channel}
+
+\subsection{Problem}
+A windowless process has no \texttt{WM\_CLOSE} to receive, so there is no
+clean way to ask it to exit from the outside. Terminating it with
+\texttt{taskkill /F} skips Unreal's orderly shutdown path
+(\texttt{EndPlay} $\rightarrow$ \texttt{StopBroadcastInternal} $\rightarrow$
+Spout sender release), leaving a ``ghost'' sender registered in Spout's
+shared memory. The next launch's sender then gets auto-renamed
+(\texttt{"Sender Component\_1"}, \texttt{"\_2"}, \ldots) by Spout's naming
+collision handling, breaking any receiver (LiveBoard, OBS, \ldots) hard-wired
+to the original fixed name.
+
+\subsection{Fix: File-Based Command Channel}
+\texttt{StartupModule()} now computes a per-project stop-file path:
+
+\begin{lstlisting}[style=cpp]
+StopFilePath = FPaths::Combine(
+    FString(FPlatformProcess::UserTempDir()),
+    FString::Printf(TEXT("%s_SpoutStop"), FApp::GetProjectName()));
+\end{lstlisting}
+
+i.e.\ \texttt{\%TEMP\%\textbackslash{}<ProjectName>\_SpoutStop}. Any stale
+file from a previous run is deleted immediately on startup (otherwise a new
+session would see it and self-terminate roughly one second in). A
+\texttt{FTSTicker} callback (\texttt{CheckStopFile}), registered on the
+engine's core ticker at a 1-second period, polls for that file's existence.
+The core ticker runs even with no viewport, so this works in headless mode.
+
+When the file is detected:
+\begin{enumerate}
+    \item It is deleted immediately (one-shot semantics --- otherwise it
+        would also kill the \emph{next} session right after startup).
+    \item \texttt{RequestEngineExit(...)} is called --- Unreal's
+        \emph{orderly} exit path, as opposed to a hard kill: it lets the
+        current frame finish, tears the world down, and lets
+        \texttt{EndPlay}/\texttt{StopBroadcastInternal} release the Spout
+        sender from shared memory before the process actually exits
+        ($\sim$1.5\,s in practice).
+\end{enumerate}
+
+Two guards prevent unwanted behavior:
+\begin{itemize}
+    \item \texttt{GIsEditor} --- the channel is inert inside the editor.
+        A file dropped in \texttt{\%TEMP\%} must never be able to close an
+        open Editor session; the channel is only meaningful for
+        packaged/game sessions.
+    \item \texttt{IsEngineExitRequested()} --- avoids requesting exit twice
+        if it is already in progress.
+\end{itemize}
+
+The ticker handle (\texttt{StopFileTickerHandle}) is explicitly removed in
+\texttt{ShutdownModule()} \emph{before} the module object is destroyed,
+since the delegate was bound with \texttt{CreateRaw} (no lifetime
+tracking) --- a tick firing after that point would call into freed memory.
+
+An external tool (e.g.\ a \texttt{.bat} script, not part of this
+repository) can request a clean shutdown of a running headless instance
+simply by doing:
+\begin{lstlisting}[language=bash]
+type nul > "%TEMP%\<ProjectName>_SpoutStop"
+\end{lstlisting}
+
+\section{Fix 4 --- Receiver Frame Synchronization}
+\label{sec:frame-sync}
+
+\subsection{Problem}
+The receiver copied the sender's shared D3D11 texture on every tick with
+no synchronization against the sender's write cadence, risking tearing or
+reading a texture mid-write when sender and receiver frame rates diverge.
+
+\subsection{Fix}
+\texttt{USpoutReceiverComponent} now tracks a small piece of Spout
+frame-sync state:
+
+\begin{lstlisting}[style=cpp]
+bool bSyncInitialized = false;
+char SpoutSyncName[256] = {};
+\end{lstlisting}
+
+In \texttt{ReceiveOnce()}, once the active sender's name is known, the
+mutex/frame-count objects are (re)initialized whenever the sender identity
+changes (first connection, or a different sender name than last time):
+
+\begin{lstlisting}[style=cpp]
+if (!bSyncInitialized || FCStringAnsi::Strcmp(SpoutSyncName, SenderName) != 0)
+{
+    if (bSyncInitialized)
+    {
+        SpoutDX12->frame.CloseAccessMutex();
+        SpoutDX12->frame.DisableFrameCount();
+    }
+    SpoutDX12->frame.CreateAccessMutex(SenderName);
+    SpoutDX12->frame.EnableFrameCount(SenderName);
+    FCStringAnsi::Strncpy(SpoutSyncName, SenderName, 256);
+    bSyncInitialized = true;
+}
+\end{lstlisting}
+
+Two checks then guard the actual texture copy:
+\begin{itemize}
+    \item \textbf{New-frame check}: \texttt{SpoutDX12->frame.GetNewFrame()}
+        is a non-blocking read of the sender's frame semaphore; if the
+        sender has not produced a new frame since the last read, the
+        receiver skips the copy this tick. The very first frame
+        (\texttt{bConnected == false}) always bypasses this check so the
+        initial image is never dropped.
+    \item \textbf{Access mutex}: \texttt{SpoutDX12->frame.CheckAccess()} is
+        acquired (non-blocking) immediately before
+        \texttt{Ctx11->CopyResource(...)}, and released with
+        \texttt{AllowAccess()} immediately after. If the sender is
+        mid-write, \texttt{CheckAccess()} returns \texttt{false}, the copy
+        is skipped for that tick, and a missed-frame counter
+        (\texttt{StatMissedFramesAccum}) is incremented for diagnostics.
+\end{itemize}
+
+Sync state is torn down symmetrically in both
+\texttt{StopReceivingInternal()} and \texttt{ReleaseSpoutDevices()}
+(\texttt{CloseAccessMutex()} / \texttt{DisableFrameCount()}, then
+\texttt{bSyncInitialized = false} and \texttt{SpoutSyncName[0] = '\textbackslash 0'}), so a
+subsequent \texttt{StartReceiving()} reinitializes cleanly rather than
+inheriting stale mutex/semaphore handles.
+
+\section{Fix 5 --- Third-Party Linker Configuration}
+\label{sec:linker}
+
+\subsection{Symptom}
+Crash at runtime tied to \texttt{spoutFrameCount} symbol resolution.
+
+\subsection{Root Cause}
+\texttt{SpoutDX12.dll} statically embeds the \texttt{spoutDX} /
+\texttt{spoutFrameCount} implementation. The module's
+\texttt{Spout2\_DX12.Build.cs} previously linked \emph{both}
+\texttt{Spout.lib} and \texttt{SpoutDX12.lib}, and delay-loaded \emph{both}
+\texttt{Spout.dll} and \texttt{SpoutDX12.dll}. Linking \texttt{Spout.lib}
+caused the linker to resolve \texttt{spoutFrameCount} symbols against
+\texttt{Spout.dll} instead of the statically-embedded copy inside
+\texttt{SpoutDX12.dll}. Since \texttt{Spout.dll} is never actually loaded
+at runtime by \texttt{SpoutDX12.dll}, any call through those symbols
+crashed.
+
+\subsection{Fix}
+\begin{lstlisting}[basicstyle=\ttfamily\small,backgroundcolor=\color{codebg},frame=single,breaklines=true]
+- PublicAdditionalLibraries.Add(Path.Combine(LibDir, "Spout.lib"));
+  PublicAdditionalLibraries.Add(Path.Combine(LibDir, "SpoutDX12.lib"));
+
+- PublicDelayLoadDLLs.AddRange(new[] { "Spout.dll", "SpoutDX12.dll" });
++ PublicDelayLoadDLLs.Add("SpoutDX12.dll");
+\end{lstlisting}
+
+Only \texttt{SpoutDX12.lib} is linked, and only \texttt{SpoutDX12.dll} is
+delay-loaded; \texttt{Spout.dll} is still staged next to the packaged
+executable as a runtime dependency (unrelated third-party consumers may
+still need the standalone Spout runtime), but the plugin's own code no
+longer resolves symbols against it.
+
+\section{Addition --- Command-Line Build Script}
+\label{sec:build}
+
+A new \texttt{Build.bat} wraps
+\texttt{RunUAT.bat BuildPlugin}, the official Epic tooling for compiling a
+standalone plugin without an open Editor session (this is the same
+mechanism used to produce Marketplace plugin binaries). It takes two
+optional positional arguments, \texttt{EngineDir} (default
+\texttt{C:\textbackslash Program Files\textbackslash Epic
+Games\textbackslash UE\_5.8}) and \texttt{OutputDir} (default
+\texttt{.\textbackslash Build\textbackslash Spout2\_DX12}), and invokes:
+
+\begin{lstlisting}[language=bash]
+RunUAT.bat BuildPlugin -Plugin=<uplugin path> -Package=<OutputDir> \
+    -TargetPlatforms=Win64 -Rocket
+\end{lstlisting}
+
+This compiles three Win64 configurations --- Editor, Game Development, Game
+Shipping --- and stages a self-contained, redistributable plugin folder
+(\texttt{.uplugin}, \texttt{Binaries/}, \texttt{Source/},
+\texttt{Resources/}) at \texttt{OutputDir}. The script was validated
+end-to-end against UE~5.8: all three configurations compiled and linked
+successfully (\texttt{BUILD SUCCESSFUL}), total wall time $\approx$
+2\,minutes on the reference machine. Full usage and installation
+instructions (per-project vs.\ engine-wide) are documented separately in
+\texttt{BUILD\_INSTRUCTIONS.md}.
+
+\section{Summary Table}
+
+\begin{center}
+\begin{tabular}{@{}p{0.28\linewidth}p{0.32\linewidth}p{0.32\linewidth}@{}}
+\toprule
+Change & Failure mode addressed & Mechanism \\
+\midrule
+Deferred bridge start & GPU hang in
+    \texttt{-RenderOffScreen} sessions & world-time + PSO-idle gate,
+    capped retry \\
+No explicit DLL unload & Shipping shutdown access violation &
+    leave \texttt{SpoutDX12.dll} mapped until process exit \\
+File-based stop channel & Ghost sender after \texttt{taskkill /F} &
+    polled stop-file $\rightarrow$ \texttt{RequestEngineExit} \\
+Receiver frame sync & Tearing / mid-write reads & access mutex +
+    frame-count semaphore around \texttt{CopyResource} \\
+Linker fix & Crash resolving
+    \texttt{spoutFrameCount} & drop \texttt{Spout.lib} /
+    \texttt{Spout.dll} delay-load \\
+\texttt{Build.bat} & No command-line build path & wraps
+    \texttt{RunUAT.bat BuildPlugin} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

@@ -61,6 +61,10 @@ The required DLLs are handled by the plugin. No manual engine copy step is neede
 
 Package the project normally. The plugin stages the required DLLs next to the packaged executable automatically.
 
+### Building from the Command Line
+
+Run `Build.bat` to compile the plugin standalone, without opening the Editor. See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for prerequisites, usage, where the output goes, and how to install it project-wide or engine-wide.
+
 ---
 
 ## Sender Component

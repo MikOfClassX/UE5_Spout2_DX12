@@ -8,6 +8,9 @@
 #include "RenderCommandFence.h"
 #include "RHICommandList.h"
 #include "TextureResource.h"
+#include "TimerManager.h"
+#include "PipelineStateCache.h"
+#include "ShaderPipelineCache.h"
 #include "Engine/World.h"
 #include "UObject/UnrealType.h"
 
@@ -639,6 +642,92 @@ void USpoutReceiverComponent::StartReceiving()
 	}
 #endif
 
+	// ------------------------------------------------------------------
+	// DEFERRED START — same startup-race protection as the sender (the
+	// receiver opens the same D3D11On12 bridge; see the full write-up in
+	// SpoutSenderComponent.h / StartBroadcastConfigured).
+	//
+	// Opening the bridge while the engine is still rendering its first
+	// frames or compiling startup PSOs can deadlock the D3D12 queue in
+	// windowless (-RenderOffScreen) sessions. Hold the start until a
+	// minimum world time has passed AND PSO precaching is idle;
+	// MaxStartDelaySeconds caps the wait as a safety valve.
+	// ------------------------------------------------------------------
+	{
+		// Engage only in a game world (in the editor a window's Present
+		// paces the GPU queue, the race cannot happen) and only if the
+		// grace period was not disabled by setting StartDelaySeconds to 0.
+		UWorld* World = GetWorld();
+		if (World && World->IsGameWorld() && StartDelaySeconds > 0.0f)
+		{
+			const float WorldSeconds = static_cast<float>(World->GetTimeSeconds());
+
+			// Condition 1: minimum grace period of world time has elapsed.
+			const bool bMinTimePassed = WorldSeconds >= StartDelaySeconds;
+
+			// Condition 2: shader/PSO precompilation is idle — both the
+			// on-demand precache queue (PipelineStateCache) and the bundled
+			// pipeline cache replay (FShaderPipelineCache) must be empty.
+			// That startup compile flood is what hung the GPU at Frame 0.
+			const int32 PendingPSOs =
+				static_cast<int32>(PipelineStateCache::NumActivePrecacheRequests()) +
+				static_cast<int32>(FShaderPipelineCache::NumPrecompilesRemaining());
+
+			// Safety valve: past the cap, start regardless of pending PSOs
+			// so nothing can park the receiver forever.
+			const bool bForcedStart = MaxStartDelaySeconds > 0.0f && WorldSeconds >= MaxStartDelaySeconds;
+
+			// Defer when either condition is unmet (unless forced).
+			if (!bForcedStart && (!bMinTimePassed || PendingPSOs > 0))
+			{
+				// Retry interval: inside the grace period sleep exactly the
+				// remaining time (>= 0.1 s); after it, poll PSOs every 0.5 s.
+				const float RetryDelay = bMinTimePassed
+					? 0.5f
+					: FMath::Max(StartDelaySeconds - WorldSeconds, 0.1f);
+
+				// One-shot timer that simply re-enters StartReceiving() and
+				// re-evaluates from scratch. Unlike the sender there is no
+				// state to stash: the receiver reads its configuration from
+				// component properties (SpoutSenderName, OutputRenderTarget)
+				// that are already set. StopReceivingInternal cancels this
+				// handle if the receiver is stopped meanwhile.
+				World->GetTimerManager().SetTimer(
+					StartDelayTimerHandle,
+					this,
+					&USpoutReceiverComponent::StartReceiving,
+					RetryDelay,
+					false);
+
+				// Log the deferral once per cycle, not on every retry.
+				if (!bLoggedStartDeferral)
+				{
+					bLoggedStartDeferral = true;
+					UE_LOG(LogSpoutRX, Display, TEXT("StartReceiving: Holding receiver start (world time %.2fs, min %.2fs, pending PSO precompiles %d, cap %.2fs)."), WorldSeconds, StartDelaySeconds, PendingPSOs, MaxStartDelaySeconds);
+				}
+				// Bail out WITHOUT opening the Spout bridge; the timer
+				// above will bring us back here.
+				return;
+			}
+
+			// The deferred start is going through: close the log cycle by
+			// saying HOW (Warning = cap expired with PSOs still compiling,
+			// forced start; Display = precaching drained, clean start).
+			if (bLoggedStartDeferral)
+			{
+				bLoggedStartDeferral = false;
+				if (bForcedStart && PendingPSOs > 0)
+				{
+					UE_LOG(LogSpoutRX, Warning, TEXT("StartReceiving: Deferred start forced by MaxStartDelaySeconds at world time %.2fs with %d PSO precompiles still pending."), WorldSeconds, PendingPSOs);
+				}
+				else
+				{
+					UE_LOG(LogSpoutRX, Display, TEXT("StartReceiving: Deferred start proceeding at world time %.2fs (PSO precaching idle)."), WorldSeconds);
+				}
+			}
+		}
+	}
+
 	if (!OutputRenderTarget)
 	{
 		UE_LOG(LogSpoutRX, Warning, TEXT("StartReceiving: OutputRenderTarget is null."));
@@ -714,6 +803,17 @@ void USpoutReceiverComponent::StopReceiving()
 
 void USpoutReceiverComponent::StopReceivingInternal(bool bClearDesiredState)
 {
+	// Cancel any deferred-start retry still in flight (see StartReceiving).
+	// Without this, stopping the receiver while a start is being held back
+	// would leave an armed timer that restarts it on its own up to 0.5 s
+	// later. Also reset the one-shot log flag so a future deferral logs
+	// its "holding start" line again.
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(StartDelayTimerHandle);
+	}
+	bLoggedStartDeferral = false;
+
 	// Mark receiver as stopped.
 	bReceiving = false;
 	SetComponentTickEnabled(false);
@@ -757,12 +857,19 @@ void USpoutReceiverComponent::StopReceivingInternal(bool bClearDesiredState)
 
 	if (SpoutDX12)
 	{
+		if (bSyncInitialized)
+		{
+			SpoutDX12->frame.CloseAccessMutex();
+			SpoutDX12->frame.DisableFrameCount();
+		}
 		SpoutDX12->ReleaseReceiver();
 		SpoutDX12->CloseDirectX12();
 	}
 
 	ReleaseFenceObjects();
 
+	bSyncInitialized = false;
+	SpoutSyncName[0] = '\0';
 	bConnected = false;
 }
 
@@ -881,11 +988,20 @@ void USpoutReceiverComponent::ReleaseSpoutDevices()
 
 	if (SpoutDX12)
 	{
+		if (bSyncInitialized)
+		{
+			SpoutDX12->frame.CloseAccessMutex();
+			SpoutDX12->frame.DisableFrameCount();
+		}
 		SpoutDX12->ReleaseReceiver();
 		SpoutDX12->CloseDirectX12();
 		delete SpoutDX12;
 		SpoutDX12 = nullptr;
 	}
+
+	bSyncInitialized = false;
+	SpoutSyncName[0] = '\0';
+
 	if (SpoutInfo)
 	{
 		delete SpoutInfo;
@@ -908,9 +1024,10 @@ bool USpoutReceiverComponent::ReceiveOnce()
 
 	// Read sender info from Spout.
 	unsigned int SW = 0, SH = 0; HANDLE Share = nullptr; DWORD Fmt = 0;
+	const char* SenderName = nullptr;
 	{
-		const char* Name = SpoutDX12->GetSenderName();
-		if (!Name || !SpoutInfo || !SpoutInfo->GetSenderInfo(Name, SW, SH, Share, Fmt) || !Share)
+		SenderName = SpoutDX12->GetSenderName();
+		if (!SenderName || !SpoutInfo || !SpoutInfo->GetSenderInfo(SenderName, SW, SH, Share, Fmt) || !Share)
 		{
 			UE_LOG(LogSpoutRX, Error, TEXT("ReceiveOnce: no valid sender/share."));
 			bConnected = false;
@@ -922,7 +1039,31 @@ bool USpoutReceiverComponent::ReceiveOnce()
 		Incoming.Format = Fmt ? Fmt : DXGI_FORMAT_B8G8R8A8_UNORM;
 
 		UE_LOG(LogSpoutRX, Verbose, TEXT("Sender '%S'  %ux%u  fmt=%u  Share=%p"),
-			Name, SW, SH, Incoming.Format, Share);
+			SenderName, SW, SH, Incoming.Format, Share);
+	}
+
+	// Initialize (or reinitialize on sender change) the Spout access mutex and
+	// frame-count semaphore so we can detect new frames and prevent tearing.
+	if (!bSyncInitialized || FCStringAnsi::Strcmp(SpoutSyncName, SenderName) != 0)
+	{
+		if (bSyncInitialized)
+		{
+			SpoutDX12->frame.CloseAccessMutex();
+			SpoutDX12->frame.DisableFrameCount();
+		}
+		SpoutDX12->frame.CreateAccessMutex(SenderName);
+		SpoutDX12->frame.EnableFrameCount(SenderName);
+		FCStringAnsi::Strncpy(SpoutSyncName, SenderName, 256);
+		bSyncInitialized = true;
+	}
+
+	// Skip if sender hasn't produced a new frame since our last read.
+	// GetNewFrame() is non-blocking: reads the sender's frame semaphore.
+	// We bypass this check on the very first frame (bConnected == false) to
+	// guarantee the initial frame is always shown.
+	if (bConnected && !SpoutDX12->frame.GetNewFrame())
+	{
+		return false;
 	}
 
 	// Open shared DX11 texture from sender.
@@ -1025,11 +1166,23 @@ bool USpoutReceiverComponent::ReceiveOnce()
 	}
 
 
+	// Acquire exclusive access to the shared sender texture (non-blocking).
+	// The sender holds this mutex while writing; if it returns false the sender
+	// is mid-write and we skip to avoid tearing.
+	if (!SpoutDX12->frame.CheckAccess())
+	{
+		++StatMissedFramesAccum;
+		return false;
+	}
+
 	// Copy sender texture to local DX11 copy texture.
 	Ctx11->CopyResource(
 		reinterpret_cast<ID3D11Resource*>(Incoming.GPUCopy11),
 		reinterpret_cast<ID3D11Resource*>(Src11)
 	);
+
+	// Release access mutex so the sender can write the next frame.
+	SpoutDX12->frame.AllowAccess();
 
 	++StatCopyCount;
 

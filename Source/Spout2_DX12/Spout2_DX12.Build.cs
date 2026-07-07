@@ -57,12 +57,14 @@ public class Spout2_DX12 : ModuleRules
 
             PublicIncludePaths.Add(IncDir);
 
-            // Link against import libs
-            PublicAdditionalLibraries.Add(Path.Combine(LibDir, "Spout.lib"));
+            // SpoutDX12.dll already embeds all spoutDX/spoutFrameCount code statically,
+            // so we only need SpoutDX12.lib. Linking Spout.lib would cause the linker to
+            // resolve spoutFrameCount methods to Spout.dll (delay-loaded), but Spout.dll
+            // is never loaded at runtime (SpoutDX12.dll doesn't import it), causing a crash.
             PublicAdditionalLibraries.Add(Path.Combine(LibDir, "SpoutDX12.lib"));
 
-            // Delay-load by DLL names only (no paths).
-            PublicDelayLoadDLLs.AddRange(new[] { "Spout.dll", "SpoutDX12.dll" });
+            // Only SpoutDX12.dll needs delay-loading; Spout.dll is not used at runtime.
+            PublicDelayLoadDLLs.Add("SpoutDX12.dll");
 
             // Place alongside built target binaries
             RuntimeDependencies.Add("$(BinaryOutputDir)/Spout.dll",

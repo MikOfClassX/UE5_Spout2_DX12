@@ -4,6 +4,7 @@
 #include "Components/ActorComponent.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Engine/Texture2D.h"
+#include "Engine/TimerHandle.h"
 #include "RHIResources.h"
 #include "HAL/PlatformTime.h"
 #include "SpoutWorldPolicy.h"
@@ -49,6 +50,30 @@ public:
 	// Specific sender name to connect to (empty = first available)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spout Receiver", meta = (ToolTip = "The specific Spout sender name to connect to. Leave empty to connect to the first available sender."))
 	FString SpoutSenderName;
+
+	// ------------------------------------------------------------------
+	// DEFERRED START (fix for the headless GPU crash, 2026-07-03)
+	//
+	// The receiver opens the same D3D11On12 interop bridge as the sender,
+	// and doing that during the engine's first frames (map load, PSO
+	// precompile flood, no swapchain pacing the queue in -RenderOffScreen)
+	// raced the D3D12 3D queue and hung the GPU (DXGI_ERROR_DEVICE_HUNG at
+	// Frame 0). Same protection as USpoutSenderComponent: hold the start
+	// until world time >= StartDelaySeconds AND PSO precaching is idle,
+	// with MaxStartDelaySeconds as a hard cap. See the sender header for
+	// the full write-up; implemented in StartReceiving().
+	// ------------------------------------------------------------------
+
+	// Condition 1: minimum world-time grace period. 0 disables the whole
+	// deferral mechanism (start immediately, pre-fix behaviour).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spout Receiver", meta = (ClampMin = "0.0", ToolTip = "Minimum seconds of world time before opening the Spout bridge. The start is additionally held until engine PSO precaching is idle, so heavy scenes wait as long as they need. Opening the D3D11On12 interop during the engine's startup frames can deadlock the D3D12 queue in windowless sessions (-RenderOffScreen). Set to 0 to start immediately."))
+	float StartDelaySeconds = 2.0f;
+
+	// Safety valve for condition 2 (PSO idle): past this world time the
+	// receiver starts even if precaching is still busy (logged as a
+	// Warning). 0 = no cap, wait for PSO idle however long it takes.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spout Receiver", meta = (ClampMin = "0.0", ToolTip = "Safety cap: if PSO precaching is still busy after this many seconds of world time, start anyway so the receiver can never be held back forever. Set to 0 to wait for PSO precaching without a cap."))
+	float MaxStartDelaySeconds = 15.0f;
 
 	// Manually start the receiver
 	UFUNCTION(BlueprintCallable, Category = "Spout")
@@ -154,6 +179,14 @@ private:
 	// Time vars
 	float TickAccumulator = 0.f;
 	float TargetInterval = 1.0f / 60.0f;
+	// Retry timer for the deferred start (see StartDelaySeconds above).
+	// Keeping the handle lets StopReceivingInternal cancel a pending retry;
+	// otherwise stopping during the deferral window would leave a "zombie"
+	// timer that restarts the receiver on its own.
+	FTimerHandle StartDelayTimerHandle;
+	// Log-throttle flag: the "holding receiver start" message is emitted
+	// only once per deferral cycle instead of every 0.5 s retry.
+	bool bLoggedStartDeferral = false;
 
 	// State flags
 	bool bReceiving = false;
@@ -192,6 +225,10 @@ private:
 	#endif
 
 	bool bPendingOneShotStop = false;
+
+	// Spout frame sync state
+	bool bSyncInitialized = false;
+	char SpoutSyncName[256] = {};
 
 	// DX11 and DX12 RHI devices
 	static struct ID3D12Device* GetUE_D3D12Device();
