@@ -53,7 +53,25 @@ THIRD_PARTY_INCLUDES_END
 DEFINE_LOG_CATEGORY(LogSpoutRX);
 DEFINE_LOG_CATEGORY(LogSpoutSender);
 
-// Spout2_DX12 module implementation
+// Spout2_DX12 module implementation.
+// Unreal calls this by itself when the plugin loads, right after the
+// engine starts (LoadingPhase = "Default" in Spout2_DX12.uplugin). We
+// never call this function ourselves.
+//
+// How the stop-file channel works (plugin side):
+//   - StartupModule() adds CheckStopFile() to the core ticker. Once per
+//     second, it checks for the file "%TEMP%\<ProjectName>_SpoutStop"
+//     (for example "SunTemple_SpoutStop"). The core ticker runs in the
+//     main loop even with no window, so this works in headless
+//     sessions too, where there is no window to close.
+//   - As soon as it finds the file, it CONSUMES it: it deletes the
+//     file right away (this is a one-time command — if we did not
+//     delete it, it would also close the next session, one second
+//     after it starts) and then calls RequestEngineExit().
+//   - RequestEngineExit() is Unreal's clean, normal way to close: it
+//     finishes the current frame, shuts the world down, and runs
+//     EndPlay -> StopBroadcastInternal -> ReleaseSender, which removes
+//     the sender from shared memory. This takes about 1.5 seconds.
 void FSpout2_DX12Module::StartupModule()
 {
 #if PLATFORM_WINDOWS
@@ -88,48 +106,48 @@ void FSpout2_DX12Module::StartupModule()
     }
 
     // ------------------------------------------------------------------
-    // Graceful-stop channel for windowless sessions (-RenderOffScreen).
-    // See the full rationale in Spout2_DX12.h next to CheckStopFile().
+    // STOP FILE CHANNEL for sessions with no window (-RenderOffScreen).
+    // Full explanation is in Spout2_DX12.h, next to CheckStopFile().
     //
-    // The path is "<TEMP>\<ProjectName>_SpoutStop":
-    //  - UserTempDir() is the same %TEMP% the stop .bat writes into with
-    //    'type nul > "%TEMP%\..."', so the two sides always agree;
-    //  - FApp::GetProjectName() keeps the name project-specific (here:
-    //    "VirtualStudio_SpoutStop"), so the plugin works unchanged in any
-    //    other project and two different games can coexist.
+    // The file path is "<TEMP>\<ProjectName>_SpoutStop":
+    //  - UserTempDir() is the same %TEMP% folder the stop .bat writes
+    //    to, so both sides always agree on the path;
+    //  - FApp::GetProjectName() makes the name specific to this project
+    //    (here: "VirtualStudio_SpoutStop"), so it works the same way in
+    //    any project, and two different games will not clash.
     StopFilePath = FPaths::Combine(
         FString(FPlatformProcess::UserTempDir()),
         FString::Printf(TEXT("%s_SpoutStop"), FApp::GetProjectName()));
 
-    // Delete any STALE stop file left over from a previous session (e.g.
-    // the stop .bat was run while the game was not running). Without this,
-    // a new run would see the old file and shut itself down ~1 s after
-    // startup. Args: (path, RequireExists=false, EvenReadOnly=false,
-    // Quiet=true) -> silent no-op when the file is not there.
+    // Delete any OLD stop file left from a previous session (for example,
+    // if the stop .bat ran while the game was not running). If we don't
+    // do this, a new run would see the old file and shut down by itself
+    // about 1 second after start. The last argument (Quiet=true) means:
+    // do nothing quietly if the file is not there.
     IFileManager::Get().Delete(*StopFilePath, false, false, true);
 
-    // Poll for the stop file once per second on the engine's core ticker.
-    // The core ticker runs in the main loop even with no viewport/window,
-    // so it works in headless sessions. CreateRaw is safe here because the
-    // ticker is removed in ShutdownModule before this object goes away.
+    // Check for the stop file once per second, using the engine's core
+    // ticker. This ticker keeps running even with no window, so it also
+    // works in headless mode. CreateRaw is safe here because we remove
+    // this ticker in ShutdownModule before the module is destroyed.
     StopFileTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
         FTickerDelegate::CreateRaw(this, &FSpout2_DX12Module::CheckStopFile),
         1.0f);
 #endif
 }
 
-// Called by the core ticker once per second (see StartupModule). This is
-// the consumer side of the file-based stop channel used by
-// Ferma_Headless.bat to close a windowless session cleanly.
+// Called once per second by the core ticker (see StartupModule). This
+// function checks for the stop file created by Ferma_Headless.bat, to
+// close a windowless session the clean way.
 bool FSpout2_DX12Module::CheckStopFile(float DeltaTime)
 {
 #if PLATFORM_WINDOWS
-    // Two guards:
-    //  - GIsEditor: never react inside the editor. A file dropped in %TEMP%
-    //    must not be able to close the editor while you are working; this
-    //    channel only makes sense for packaged/game sessions.
-    //  - IsEngineExitRequested(): the exit is already in progress (from us
-    //    or anyone else), do not request it again.
+    // Two checks before we do anything:
+    //  - GIsEditor: never do this inside the editor. A file in %TEMP%
+    //    must never be able to close the editor while you work. This
+    //    feature is only for packaged/game sessions.
+    //  - IsEngineExitRequested(): if we are already closing (started by
+    //    us or something else), do not ask again.
     if (GIsEditor || IsEngineExitRequested())
     {
         return true;
@@ -137,42 +155,47 @@ bool FSpout2_DX12Module::CheckStopFile(float DeltaTime)
 
     if (!StopFilePath.IsEmpty() && FPaths::FileExists(StopFilePath))
     {
-        // Consume the file first (one-shot command): if it stayed on disk
-        // it would kill the NEXT session too, right after startup.
+        // Delete the file first (it is a one-time command). If we leave
+        // it on disk, it would also close the NEXT session, right after
+        // it starts.
         IFileManager::Get().Delete(*StopFilePath, false, false, true);
         UE_LOG(LogSpoutSender, Display, TEXT("Stop file detected at '%s'. Requesting clean engine exit so Spout senders unregister properly."), *StopFilePath);
 
-        // RequestEngineExit is Unreal's ORDERLY exit: it lets the frame
-        // finish, tears the world down (EndPlay -> StopBroadcastInternal),
-        // and releases the Spout sender from shared memory. This is what a
-        // taskkill /F cannot guarantee, and it is why no ghost sender is
-        // left behind for LiveBoard/OBS. Takes ~1.5 s in practice.
+        // RequestEngineExit is Unreal's normal, clean way to close: it
+        // finishes the current frame, shuts the world down properly
+        // (EndPlay -> StopBroadcastInternal), and removes the Spout
+        // sender from shared memory. A forced kill (taskkill /F) cannot
+        // do this, and that is why it used to leave a "ghost" sender
+        // behind. This clean exit takes about 1.5 seconds.
         RequestEngineExit(TEXT("Spout2_DX12 stop file"));
     }
 #endif
-    // Always keep the ticker alive; returning false would unregister it.
+    // Keep this ticker running. Returning false would stop it.
     return true;
 }
 
-// Spout2_DX12 module shutdown
+// Spout2_DX12 module shutdown.
+// Unreal calls this by itself when the plugin unloads — this happens
+// when the engine closes, or when the plugin module is unloaded during
+// a hot-reload in the editor. We never call this function ourselves.
 void FSpout2_DX12Module::ShutdownModule()
 {
 #if PLATFORM_WINDOWS
-    // Unregister the stop-file poller BEFORE this module object dies: the
-    // delegate was bound with CreateRaw (no lifetime tracking), so a tick
-    // fired after shutdown would call into freed memory.
+    // Stop checking for the stop file BEFORE this module is destroyed.
+    // We used CreateRaw to set it up, which does not track object
+    // lifetime, so a tick after shutdown would touch freed memory.
     if (StopFileTickerHandle.IsValid())
     {
         FTSTicker::GetCoreTicker().RemoveTicker(StopFileTickerHandle);
         StopFileTickerHandle.Reset();
     }
 
-    // Intentionally do NOT free the SpoutDX12.dll handle here (the original
-    // plugin did: FPlatformProcess::FreeDllHandle(MyDllHandle)). In
-    // monolithic Shipping builds, late static destructors can still call
-    // into the DLL after module shutdown; unloading it here caused an
-    // access violation during process teardown. Keeping it loaded is
-    // harmless: the OS reclaims the DLL when the process exits anyway.
+    // We do NOT unload SpoutDX12.dll here on purpose (the old plugin
+    // code did: FPlatformProcess::FreeDllHandle(MyDllHandle)). In
+    // Shipping builds, some code can still call into the DLL late
+    // during shutdown, after it would already be unloaded — this caused
+    // a crash. Leaving the DLL loaded is safe: the OS frees it anyway
+    // when the process closes.
     MyDllHandle = nullptr;
 #endif
 }
