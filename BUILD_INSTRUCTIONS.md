@@ -60,6 +60,11 @@ Build\Spout2_DX12\
 > varianti dell'SDK Spout non referenziate da `Spout2_DX12.Build.cs`: non
 > servono a compilare né a far girare il plugin, sono solo eredità del setup
 > iniziale.
+>
+> Il link vero è in `Spout2_DX12.Build.cs` (`PublicAdditionalLibraries.Add(...)`):
+> solo `SpoutDX12.lib` viene linkata; `Spout.dll`/`SpoutDX12.dll` vengono
+> invece copiate accanto ai binari via `RuntimeDependencies`, per essere
+> disponibili a runtime.
 
 `Source\` è incluso interamente così l'Editor può ricompilare il plugin per
 altre versioni dell'Engine senza dipendenze esterne. Tutto è distribuibile
