@@ -1013,15 +1013,31 @@ void USpoutSenderComponent::OnGameViewportBackBufferReady_RenderThread(SWindow& 
 #endif
 }
 
+// StopBroadcastInternal() is a private helper. Only code inside this
+// class calls it. Call stacks that lead here:
+//   (Blueprint/game) -> StopBroadcast() -> StopBroadcastInternal()
+//     (the only caller that clears everything: name, render target, FPS)
+//   Unreal (Actor's EndPlay chain) -> EndPlay() -> StopBroadcastInternal()
+//   Unreal (component unregisters) -> OnUnregister() -> StopBroadcastInternal()
+//   Editor property changed -> PostEditChangeProperty() -> RefreshEditorState() -> StopBroadcastInternal()
+//   StartBroadcastConfigured() -> StopBroadcastInternal()
+//     (self-cleanup: already broadcasting and starting again, or the
+//     game-viewport callback failed to register)
+//   StartBroadcastConfigured() -> AcquireEditorOwnership() -> StopBroadcastInternal()
+//     (called on ANOTHER sender component, not on "this" one — makes
+//     that other component give up a sender name "this" one now needs)
+// The two bool parameters control how much we clear. We pass true
+// only from StopBroadcast(), when the user really wants to stop for
+// good. Everywhere else we pass false, false, because we plan to
+// start again right after, with the same settings.
 void USpoutSenderComponent::StopBroadcastInternal(bool bClearConfiguration, bool bClearDesiredState)
 {
     const bool bWasGameViewportSource = IsUsingGameViewportSource();
 
-    // Cancel any deferred-start retry still in flight (see
-    // StartBroadcastConfigured). Without this, stopping the sender while a
-    // start is being held back would leave an armed timer that restarts
-    // the broadcast on its own up to 0.5 s later. Also reset the one-shot
-    // log flag so a future deferral logs its "holding start" line again.
+    // Stop the wait-before-start timer if it is still running (see
+    // StartBroadcastConfigured). If we don't, the timer could start
+    // the broadcast again later, even after we already stopped it.
+    // Also reset the log flag, so the next wait logs its message again.
     if (UWorld* World = GetWorld())
     {
         World->GetTimerManager().ClearTimer(StartDelayTimerHandle);
@@ -1041,6 +1057,10 @@ void USpoutSenderComponent::StopBroadcastInternal(bool bClearConfiguration, bool
 
     if (SpoutBridge)
     {
+        // This is the line that actually removes our sender name from
+        // Spout's shared memory. Without this, the name would stay
+        // "reserved" and the next run would have to use a different
+        // name (like "Sender Component_1").
         SpoutBridge->ReleaseSender();
         SpoutBridge->SetSenderName("");
     }
@@ -1342,6 +1362,14 @@ void USpoutSenderComponent::TickComponent(float DeltaTime, ELevelTick TickType, 
 #endif
 }
 
+// We never call EndPlay ourselves. Unreal calls it through the owning
+// Actor: when the game world closes (level change, PIE stop, or the
+// engine quitting through RequestEngineExit — see ShutdownModule() in
+// Spout2_DX12.cpp for that full chain), the engine calls
+// AActor::EndPlay() on every Actor, and that Actor code then calls
+// EndPlay() on each of its components, including this one.
+// StopBroadcastInternal() below is what removes our sender name from
+// Spout — this runs well before the plugin module itself shuts down.
 void USpoutSenderComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     StopBroadcastInternal(false, false);
@@ -1764,6 +1792,26 @@ void USpoutSenderComponent::UpdateTexture()
 #endif
 }
 
+// StartBroadcastConfigured() is the private function that actually
+// starts the sender (source, name, FPS already decided). It runs the
+// "wait before start" check below, then opens the Spout bridge.
+// Call stacks that lead here:
+//   Retry timer expires -> StartBroadcast() -> StartBroadcastConfigured(CurrentRenderTarget, CurrentSenderName, BroadcastFPS)
+//    
+//     WHY: the SetTimer() overload used below only accepts a member
+//     function with NO parameters (void (Class::*)()). This function
+//     takes 3 parameters, so it cannot be given to SetTimer() directly
+//     — that is a compile error, not a style choice. StartBroadcast()
+//     has no parameters, so it is the one that fits, and it is why we
+//     save the settings into member variables first: so StartBroadcast()
+//     has something to read when the timer calls it later.)
+
+//   (Blueprint/game) -> StartBroadcastFromRenderTarget() -> StartBroadcastConfigured()
+//   (Blueprint/game) -> StartBroadcastGameViewport()     -> StartBroadcastConfigured()
+//   (Blueprint/game) -> StartBroadcast()                 -> StartBroadcastConfigured()
+//   Editor property changed -> PostEditChangeProperty() -> RefreshEditorState() -> StartBroadcastConfigured()
+//   Unreal (component registers) -> OnRegister() -> StartBroadcastConfigured()
+//   Unreal (gameplay starts)     -> BeginPlay()   -> StartBroadcastConfigured()
 void USpoutSenderComponent::StartBroadcastConfigured(
     UTextureRenderTarget2D* RenderTarget,
     const FString& SenderName,
@@ -1774,61 +1822,86 @@ void USpoutSenderComponent::StartBroadcastConfigured(
     bBroadcastIntentInitialized = true;
 
     // ------------------------------------------------------------------
-    // DEFERRED START — fix for the headless GPU hang (see the full story
-    // next to StartDelaySeconds in SpoutSenderComponent.h).
+    // WAIT BEFORE START.
+    // This fixes a GPU freeze in headless mode (no window).
     //
-    // Opening the D3D11On12 bridge and submitting interop work while the
-    // engine is still rendering its first frames or compiling startup PSOs
-    // can deadlock the D3D12 queue when no swapchain exists
-    // (-RenderOffScreen): the GPU crash dumps always showed the 3D queue
-    // stuck at Frame 0. Hold the real start until a minimum world time has
-    // passed AND PSO precaching is idle, so heavier scenes wait as long as
-    // they need. MaxStartDelaySeconds caps the wait as a safety valve.
+    // StartDelaySeconds and MaxStartDelaySeconds used below are both
+    // UPROPERTY floats declared in SpoutSenderComponent.h (defaults:
+    // 2.0 and 15.0). They are editable from the Editor and from
+    // Blueprint, not just from C++.
+    //
+    // If we open the bridge too early, while the engine is still busy,
+    // the GPU can freeze. This only happens with no window
+    // (-RenderOffScreen). So we wait until the game world is ready AND
+    // shaders are done compiling. MaxStartDelaySeconds is the longest
+    // time we will ever wait.
     // ------------------------------------------------------------------
 
-    // il fix lavora solo su quando è attivo in modalità game non editor
+    // This wait only happens in a real game, not in the editor.
     UWorld* World = GetWorld();
     if (World && World->IsGameWorld() && StartDelaySeconds > 0.0f)
     {
-		// tempo trascorso dall'inizio del livello
+        // Time passed since the level started.
         const float WorldSeconds = static_cast<float>(World->GetTimeSeconds());
 
-        // Verifica se è passato il tempo minimo di "grazia" impostato per lasciare che il motore si scaldi.
+        // Check if the minimum wait time already passed.
         const bool bMinTimePassed = WorldSeconds >= StartDelaySeconds;
 
-		// Conta quanti shader sono ancora in fase di compilazione. Questa è la causa principale del blocco: se il motore sta compilando, la coda della GPU è satura.
+        // Count shaders still compiling. This is the main cause of the
+        // freeze: while shaders compile, the GPU is too busy.
+        //
+        // This adds two engine counters: shaders compiling right now,
+        // plus shaders still queued from the startup pipeline cache
+        // (PSOs seen in earlier runs, replayed here to avoid stutter
+        // later). Above 0 means the GPU is still busy — not safe yet
+        // to open the Spout bridge.
         const int32 PendingPSOs =
             static_cast<int32>(PipelineStateCache::NumActivePrecacheRequests()) +
             static_cast<int32>(FShaderPipelineCache::NumPrecompilesRemaining());
 
-		// bForcedStart: Definisce un "limite massimo". Se il tempo totale trascorso supera questa soglia, 
-		// forziamo l'avvio anche se ci sono ancora shader in coda. Serve a evitare che il sender non parta mai a causa di una scena troppo pesante.
+        // bForcedStart: our safety limit. If we already waited too long,
+        // we start anyway, even if shaders are still compiling. This
+        // stops the sender from waiting forever on a heavy scene.
         const bool bForcedStart = MaxStartDelaySeconds > 0.0f && WorldSeconds >= MaxStartDelaySeconds;
 
-        // Se non siamo oltre il tempo massimo E (non è passato il tempo minimo O ci sono ancora shader in attesa), allora entriamo nel blocco di attesa.
+        // If we are not past the safety limit, AND (we did not wait
+        // enough OR shaders are still compiling), then we wait more.
         if (!bForcedStart && (!bMinTimePassed || PendingPSOs > 0))
         {
-			// Salva i parametri di configurazione in variabili membro. Poiché il retry richiamerà StartBroadcast senza argomenti, dobbiamo conservare qui i dati configurati dall'utente.
+            // Save the settings for later. The retry calls StartBroadcast
+            // with no arguments, so we save the user's settings here.
             CurrentRenderTarget = (SourceType == ESpoutSenderSourceType::RenderTarget) ? RenderTarget : nullptr;
             CurrentSenderName = SenderName;
             BroadcastFPS = FPS;
 
-            // Se siamo nel periodo di grazia: aspetta quanto manca alla scadenza. 
-		    // Se il tempo è passato ma attendiamo i PSO: attendi 0,5 secondi (polling).
+            // How long to wait before we check again. Two cases:
+            //   - bMinTimePassed == true: we are past StartDelaySeconds
+            //     already, so we are only waiting on shaders now. We
+            //     don't know when they will finish, so we just poll
+            //     again in a fixed 0.5 seconds.
+            //   - bMinTimePassed == false: we are still inside the
+            //     minimum wait time. We wait exactly what is left of it
+            //     (StartDelaySeconds - WorldSeconds), so the timer fires
+            //     right when that minimum time ends.
+            // FMath::Max(..., 0.1f) is a safety floor: it stops the
+            // delay from ever being 0 or negative (from a rounding
+            // edge case), which could fire the retry almost instantly
+            // and create a tight retry loop.
             const float RetryDelay = bMinTimePassed
                 ? 0.5f
                 : FMath::Max(StartDelaySeconds - WorldSeconds, 0.1f);
 
-			// SetTimer: Imposta un timer "one-shot" che richiamerà StartBroadcast in futuro. 
-			// Questo "mette in pausa" l'inizializzazione senza bloccare il thread principale (niente Sleep che bloccherebbe il gioco).
+            // Set a one-time timer that calls StartBroadcast again
+            // later. This pauses the start without blocking the game
+            // (we do not use Sleep, that would freeze the game).
             World->GetTimerManager().SetTimer(
-                StartDelayTimerHandle,
-                this,
-                &USpoutSenderComponent::StartBroadcast,
-                RetryDelay,
-                false);
+                StartDelayTimerHandle,                  // handle to cancel this timer later
+                this,                                    // who to call it on
+                &USpoutSenderComponent::StartBroadcast,   // what to call — itself
+                RetryDelay,                              // wait time, in seconds
+                false);                                  // fire once, not repeating
 
-            // Log the deferral once per cycle, not on every 0.5 s retry.
+            // Log this wait only once, not on every retry.
             if (!bLoggedStartDeferral)
             {
                 bLoggedStartDeferral = true;
@@ -1842,18 +1915,17 @@ void USpoutSenderComponent::StartBroadcastConfigured(
                     MaxStartDelaySeconds,
                     *BuildSenderDebugContext(this));
             }
-            // Bail out WITHOUT opening the Spout bridge; the timer above
-            // will bring us back here.
+            // Stop here. Do NOT open the Spout bridge yet. The timer
+            // above will call this function again later.
             return;
         }
 
-        // Reaching this point means the deferred start is going through.
-        // If we ever deferred, close the log cycle by saying HOW we are
-        // starting — this is what tells you in the packaged log whether
-        // the fix behaved:
-        //  - Warning: the cap expired with PSOs still compiling (start is
-        //    forced; if crashes ever come back, raise MaxStartDelaySeconds);
-        //  - Display: PSO precaching drained normally, clean start.
+        // If we get here, the wait is over and we can start now.
+        // If we waited at all, log how we are starting now:
+        //  - Warning: we hit the time limit and started anyway, with
+        //    shaders still compiling (if freezes come back, raise
+        //    MaxStartDelaySeconds);
+        //  - Display: shaders finished normally, this is a clean start.
         if (bLoggedStartDeferral)
         {
             bLoggedStartDeferral = false;

@@ -572,6 +572,14 @@ void USpoutReceiverComponent::PublishCompletedInternalBuffer()
 }
 
 // Cleanup on end play.
+// We never call EndPlay ourselves. Unreal calls it through the owning
+// Actor: when the game world closes (level change, PIE stop, or the
+// engine quitting through RequestEngineExit — see ShutdownModule() in
+// Spout2_DX12.cpp for that full chain), the engine calls
+// AActor::EndPlay() on every Actor, and that Actor code then calls
+// EndPlay() on each of its components, including this one. The
+// receiver has no sender name to remove; ReleaseSpoutDevices() below
+// just closes our Spout connection and frees its GPU resources.
 void USpoutReceiverComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	StopReceivingInternal(false);
@@ -643,76 +651,105 @@ void USpoutReceiverComponent::StartReceiving()
 #endif
 
 	// ------------------------------------------------------------------
-	// DEFERRED START — same startup-race protection as the sender (the
-	// receiver opens the same D3D11On12 bridge; see the full write-up in
+	// WAIT BEFORE START
+	//
+	// StartDelaySeconds and MaxStartDelaySeconds used below are both
+	// UPROPERTY floats declared in SpoutReceiverComponent.h (defaults:
+	// 2.0 and 15.0). They are editable from the Editor and from
+	// Blueprint, not just from C++.
+	//
+	// Same fix as the sender, for the same GPU freeze problem (the
+	// receiver opens the same bridge; see the full story in
 	// SpoutSenderComponent.h / StartBroadcastConfigured).
 	//
-	// Opening the bridge while the engine is still rendering its first
-	// frames or compiling startup PSOs can deadlock the D3D12 queue in
-	// windowless (-RenderOffScreen) sessions. Hold the start until a
-	// minimum world time has passed AND PSO precaching is idle;
-	// MaxStartDelaySeconds caps the wait as a safety valve.
+	// If we open the bridge too early, while the engine is still busy
+	// with its first frames, the GPU can freeze in headless mode
+	// (-RenderOffScreen). So we wait until the game world is ready AND
+	// shaders are done compiling. MaxStartDelaySeconds is the longest
+	// time we will ever wait.
 	// ------------------------------------------------------------------
 	{
-		// Engage only in a game world (in the editor a window's Present
-		// paces the GPU queue, the race cannot happen) and only if the
-		// grace period was not disabled by setting StartDelaySeconds to 0.
+		// This wait only happens in a real game, not in the editor
+		// (a window's Present already keeps the GPU safe), and only if
+		// StartDelaySeconds is not set to 0.
 		UWorld* World = GetWorld();
 		if (World && World->IsGameWorld() && StartDelaySeconds > 0.0f)
 		{
+			// Time passed since the level started.
 			const float WorldSeconds = static_cast<float>(World->GetTimeSeconds());
 
-			// Condition 1: minimum grace period of world time has elapsed.
+			// Check if the minimum wait time already passed.
+			// StartDelaySeconds is a threshold (default: 2 second)
 			const bool bMinTimePassed = WorldSeconds >= StartDelaySeconds;
 
-			// Condition 2: shader/PSO precompilation is idle — both the
-			// on-demand precache queue (PipelineStateCache) and the bundled
-			// pipeline cache replay (FShaderPipelineCache) must be empty.
-			// That startup compile flood is what hung the GPU at Frame 0.
+			// Check if shaders are done compiling — both compile queues
+			// must be empty. This compile work is the main cause of the
+			// freeze.
+			//
+			// This adds two engine counters: shaders compiling right
+			// now, plus shaders still queued from the startup pipeline
+			// cache. Above 0 means the GPU is still busy — not
+			// safe yet to open the Spout bridge.
 			const int32 PendingPSOs =
 				static_cast<int32>(PipelineStateCache::NumActivePrecacheRequests()) +
 				static_cast<int32>(FShaderPipelineCache::NumPrecompilesRemaining());
 
-			// Safety valve: past the cap, start regardless of pending PSOs
-			// so nothing can park the receiver forever.
+			// Safety limit: past this time, start anyway, even with
+			// shaders still compiling. Stops the receiver from waiting
+			// forever.
 			const bool bForcedStart = MaxStartDelaySeconds > 0.0f && WorldSeconds >= MaxStartDelaySeconds;
 
-			// Defer when either condition is unmet (unless forced).
+			// Wait more if we have not reached the safety limit AND
+			// (we did not wait enough OR shaders are still compiling).
 			if (!bForcedStart && (!bMinTimePassed || PendingPSOs > 0))
 			{
-				// Retry interval: inside the grace period sleep exactly the
-				// remaining time (>= 0.1 s); after it, poll PSOs every 0.5 s.
+				// How long to wait before we check again. Two cases:
+				//   - bMinTimePassed == true: we are past
+				//     StartDelaySeconds already, so we are only
+				//     waiting on shaders now. We don't know when they
+				//     will finish, so we just poll again in a fixed
+				//     0.5 seconds.
+				//   - bMinTimePassed == false: we are still inside the
+				//     minimum wait time. We wait exactly what is left
+				//     of it (StartDelaySeconds - WorldSeconds), so the
+				//     timer fires right when that minimum time ends.
+				// FMath::Max(..., 0.1f) is a safety floor: it stops
+				// the delay from ever being 0 or negative (from a
+				// rounding edge case), which could fire the retry
+				// almost instantly and create a tight retry loop.
 				const float RetryDelay = bMinTimePassed
 					? 0.5f
 					: FMath::Max(StartDelaySeconds - WorldSeconds, 0.1f);
 
-				// One-shot timer that simply re-enters StartReceiving() and
-				// re-evaluates from scratch. Unlike the sender there is no
-				// state to stash: the receiver reads its configuration from
-				// component properties (SpoutSenderName, OutputRenderTarget)
-				// that are already set. StopReceivingInternal cancels this
-				// handle if the receiver is stopped meanwhile.
+				// One-time timer that calls StartReceiving() again
+				// later. No settings to save here: the receiver reads
+				// them fresh from its own properties (SpoutSenderName,
+				// OutputRenderTarget) each time. StopReceivingInternal
+				// stops this timer if the receiver is stopped first.
+				// This does NOT block the game (no Sleep) — the timer
+				// manager fires it later on its own, on a future tick.
 				World->GetTimerManager().SetTimer(
-					StartDelayTimerHandle,
-					this,
-					&USpoutReceiverComponent::StartReceiving,
-					RetryDelay,
-					false);
+					StartDelayTimerHandle,                // out: handle to identify/cancel this timer later
+					this,                                 // object the function below will be called on
+					&USpoutReceiverComponent::StartReceiving, // function to call — this calls itself again
+					RetryDelay,                           // seconds to wait before firing
+					false);                               // bLoop = false: fire once, not on a repeat
 
-				// Log the deferral once per cycle, not on every retry.
+				// Log this wait only once, not on every retry.
 				if (!bLoggedStartDeferral)
 				{
 					bLoggedStartDeferral = true;
 					UE_LOG(LogSpoutRX, Display, TEXT("StartReceiving: Holding receiver start (world time %.2fs, min %.2fs, pending PSO precompiles %d, cap %.2fs)."), WorldSeconds, StartDelaySeconds, PendingPSOs, MaxStartDelaySeconds);
 				}
-				// Bail out WITHOUT opening the Spout bridge; the timer
-				// above will bring us back here.
+				// Stop here. Do NOT open the Spout bridge yet. The
+				// timer above will call this function again later.
 				return;
 			}
 
-			// The deferred start is going through: close the log cycle by
-			// saying HOW (Warning = cap expired with PSOs still compiling,
-			// forced start; Display = precaching drained, clean start).
+			// If we get here, the wait is over. If we waited at all,
+			// log how we are starting now (Warning = we hit the time
+			// limit and started anyway; Display = shaders finished
+			// normally, clean start).
 			if (bLoggedStartDeferral)
 			{
 				bLoggedStartDeferral = false;
@@ -803,11 +840,10 @@ void USpoutReceiverComponent::StopReceiving()
 
 void USpoutReceiverComponent::StopReceivingInternal(bool bClearDesiredState)
 {
-	// Cancel any deferred-start retry still in flight (see StartReceiving).
-	// Without this, stopping the receiver while a start is being held back
-	// would leave an armed timer that restarts it on its own up to 0.5 s
-	// later. Also reset the one-shot log flag so a future deferral logs
-	// its "holding start" line again.
+	// Stop the wait-before-start timer if it is still running (see
+	// StartReceiving). If we don't, the timer could start the receiver
+	// again later, even after we already stopped it. Also reset the
+	// log flag, so the next wait logs its message again.
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(StartDelayTimerHandle);
@@ -1042,25 +1078,31 @@ bool USpoutReceiverComponent::ReceiveOnce()
 			SenderName, SW, SH, Incoming.Format, Share);
 	}
 
-	// Initialize (or reinitialize on sender change) the Spout access mutex and
-	// frame-count semaphore so we can detect new frames and prevent tearing.
+	// Set up the lock and the frame counter (again, if the sender
+	// changed). We need these to know when a new frame is ready, and
+	// to stop reading a frame while it is still being written.
+	// Enter this block the first time (bSyncInitialized is still false),
+	// or again if SenderName is not the same one we last set up.
 	if (!bSyncInitialized || FCStringAnsi::Strcmp(SpoutSyncName, SenderName) != 0)
 	{
+		// Only close/disable if we had already set up sync before, for
+		// the OLD sender name. On the very first run bSyncInitialized
+		// is false, so there is nothing yet to close.
 		if (bSyncInitialized)
 		{
-			SpoutDX12->frame.CloseAccessMutex();
-			SpoutDX12->frame.DisableFrameCount();
+			SpoutDX12->frame.CloseAccessMutex();  // close the old sender's lock
+			SpoutDX12->frame.DisableFrameCount(); // stop tracking the old sender's frame count
 		}
-		SpoutDX12->frame.CreateAccessMutex(SenderName);
-		SpoutDX12->frame.EnableFrameCount(SenderName);
-		FCStringAnsi::Strncpy(SpoutSyncName, SenderName, 256);
-		bSyncInitialized = true;
+		SpoutDX12->frame.CreateAccessMutex(SenderName); // open the lock for the current sender
+		SpoutDX12->frame.EnableFrameCount(SenderName);  // start tracking its frame count (used by GetNewFrame())
+		FCStringAnsi::Strncpy(SpoutSyncName, SenderName, 256); // remember which sender we set up, to detect the next change
+		bSyncInitialized = true;                        // skip this whole block next time, unless the sender changes again
 	}
 
-	// Skip if sender hasn't produced a new frame since our last read.
-	// GetNewFrame() is non-blocking: reads the sender's frame semaphore.
-	// We bypass this check on the very first frame (bConnected == false) to
-	// guarantee the initial frame is always shown.
+	// Skip if the sender has no new frame since our last read.
+	// GetNewFrame() does not block, it just checks the frame counter.
+	// We skip this check on the very first frame (bConnected == false),
+	// so the first frame is always shown.
 	if (bConnected && !SpoutDX12->frame.GetNewFrame())
 	{
 		return false;
@@ -1166,22 +1208,33 @@ bool USpoutReceiverComponent::ReceiveOnce()
 	}
 
 
-	// Acquire exclusive access to the shared sender texture (non-blocking).
-	// The sender holds this mutex while writing; if it returns false the sender
-	// is mid-write and we skip to avoid tearing.
+	// CheckAccess() / AllowAccess() are the lock/unlock pair for the
+	// named mutex we opened in CreateAccessMutex() above. They are the
+	// Spout SDK functions that actually stop us from reading the
+	// sender's texture while the sender is still writing it (tearing).
+	//
+	// CheckAccess(): try to take the lock now.
+	//   - true  = we got it, nobody else is using the texture right now,
+	//     safe to read.
+	//   - false = the sender is holding it (mid-write), so we do NOT
+	//     have access. We skip this frame and try again next tick.
 	if (!SpoutDX12->frame.CheckAccess())
 	{
 		++StatMissedFramesAccum;
 		return false;
 	}
 
-	// Copy sender texture to local DX11 copy texture.
+	// Copy sender texture to local DX11 copy texture. This only runs
+	// while we hold the lock, so the sender cannot be writing at the
+	// same time.
 	Ctx11->CopyResource(
 		reinterpret_cast<ID3D11Resource*>(Incoming.GPUCopy11),
 		reinterpret_cast<ID3D11Resource*>(Src11)
 	);
 
-	// Release access mutex so the sender can write the next frame.
+	// AllowAccess(): release the lock we got from CheckAccess() above,
+	// now that the copy is done. Only call this after a successful
+	// CheckAccess() — this lets the sender write its next frame.
 	SpoutDX12->frame.AllowAccess();
 
 	++StatCopyCount;

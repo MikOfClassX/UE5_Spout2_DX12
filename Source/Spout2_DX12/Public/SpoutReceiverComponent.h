@@ -52,26 +52,26 @@ public:
 	FString SpoutSenderName;
 
 	// ------------------------------------------------------------------
-	// DEFERRED START (fix for the headless GPU crash, 2026-07-03)
+	// WAIT BEFORE START
+	// This fixes a GPU freeze that happened in headless mode (no window).
 	//
-	// The receiver opens the same D3D11On12 interop bridge as the sender,
-	// and doing that during the engine's first frames (map load, PSO
-	// precompile flood, no swapchain pacing the queue in -RenderOffScreen)
-	// raced the D3D12 3D queue and hung the GPU (DXGI_ERROR_DEVICE_HUNG at
-	// Frame 0). Same protection as USpoutSenderComponent: hold the start
-	// until world time >= StartDelaySeconds AND PSO precaching is idle,
-	// with MaxStartDelaySeconds as a hard cap. See the sender header for
-	// the full write-up; implemented in StartReceiving().
+	// The receiver opens the same bridge as the sender. If we open it
+	// too early, while the engine is still busy with its first frames,
+	// the GPU can freeze. This only happens with no window
+	// (-RenderOffScreen). Same fix as USpoutSenderComponent: wait until
+	// StartDelaySeconds has passed AND shaders are done compiling.
+	// MaxStartDelaySeconds is the longest we will ever wait. See the
+	// sender header for the full story. Code is in StartReceiving().
 	// ------------------------------------------------------------------
 
-	// Condition 1: minimum world-time grace period. 0 disables the whole
-	// deferral mechanism (start immediately, pre-fix behaviour).
+	// Minimum time to wait. Set to 0 to start right away, like before
+	// this fix.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spout Receiver", meta = (ClampMin = "0.0", ToolTip = "Minimum seconds of world time before opening the Spout bridge. The start is additionally held until engine PSO precaching is idle, so heavy scenes wait as long as they need. Opening the D3D11On12 interop during the engine's startup frames can deadlock the D3D12 queue in windowless sessions (-RenderOffScreen). Set to 0 to start immediately."))
 	float StartDelaySeconds = 2.0f;
 
-	// Safety valve for condition 2 (PSO idle): past this world time the
-	// receiver starts even if precaching is still busy (logged as a
-	// Warning). 0 = no cap, wait for PSO idle however long it takes.
+	// Longest time we will wait. If shaders are still compiling after
+	// this time, we start anyway (and log a Warning). Set to 0 for no
+	// limit.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spout Receiver", meta = (ClampMin = "0.0", ToolTip = "Safety cap: if PSO precaching is still busy after this many seconds of world time, start anyway so the receiver can never be held back forever. Set to 0 to wait for PSO precaching without a cap."))
 	float MaxStartDelaySeconds = 15.0f;
 
@@ -179,13 +179,12 @@ private:
 	// Time vars
 	float TickAccumulator = 0.f;
 	float TargetInterval = 1.0f / 60.0f;
-	// Retry timer for the deferred start (see StartDelaySeconds above).
-	// Keeping the handle lets StopReceivingInternal cancel a pending retry;
-	// otherwise stopping during the deferral window would leave a "zombie"
-	// timer that restarts the receiver on its own.
+	// Timer used for the wait-before-start (see StartDelaySeconds).
+	// We need this so StopReceivingInternal can stop the timer. If we
+	// don't, the timer could start the receiver again by itself later.
 	FTimerHandle StartDelayTimerHandle;
-	// Log-throttle flag: the "holding receiver start" message is emitted
-	// only once per deferral cycle instead of every 0.5 s retry.
+	// Makes sure we log the "waiting to start" message only one time,
+	// not on every retry.
 	bool bLoggedStartDeferral = false;
 
 	// State flags

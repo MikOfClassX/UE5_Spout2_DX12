@@ -22,35 +22,35 @@ private:
 	// ------------------------------------------------------------------
 	// CLEAN STOP FOR HEADLESS SESSIONS (-RenderOffScreen)
 	//
-	// Problem: a windowless process has no "gentle" way to be closed from
-	// the outside (no window, so no WM_CLOSE). Killing it with taskkill /F
-	// does not unregister the Spout senders: if a receiver (LiveBoard,
-	// OBS...) is still open, it keeps the "ghost" sender alive in Spout's
-	// shared memory, so on the next launch the new sender gets renamed to
-	// "Sender Component_1", "_2"... and receivers bound to the fixed name
-	// lose the stream.
+	// Problem: a process with no window has no easy way to be closed
+	// from the outside (no window means no "close" message). Killing
+	// it by force (taskkill /F) does not remove the Spout senders: if
+	// a receiver (LiveBoard, OBS...) is still open, it keeps a "ghost"
+	// sender alive. Then, next time the app starts, the new sender
+	// gets a different name ("Sender Component_1", "_2"...), and
+	// receivers looking for the original name lose the stream.
 	//
-	// Solution: a file-based command channel. An external tool
-	// (Ferma_Headless.bat) creates the file "<TEMP>\<ProjectName>_SpoutStop";
-	// CheckStopFile, registered on the core ticker with a 1 s period,
-	// detects it, deletes it and calls RequestEngineExit(): the engine runs
-	// its orderly shutdown (component EndPlay -> StopBroadcast -> Spout
-	// sender release) and no ghost is left behind. Always returns true,
-	// meaning "keep ticking me".
+	// Fix: a simple file-based signal. An outside tool
+	// (Ferma_Headless.bat) creates the file "<TEMP>\<ProjectName>_SpoutStop".
+	// CheckStopFile runs once per second and, when it finds the file,
+	// deletes it and calls RequestEngineExit(): this closes the engine
+	// the normal, clean way (EndPlay -> StopBroadcast -> Spout sender
+	// removed), so no ghost sender is left. Always returns true, which
+	// means "keep checking every second".
 	// ------------------------------------------------------------------
 	bool CheckStopFile(float DeltaTime);
 
-	// Handle of SpoutDX12.dll loaded in StartupModule. NOTE: it is no
-	// longer freed in ShutdownModule (see the comment there); the pointer
-	// is only kept as a record that the load succeeded.
+	// Handle for SpoutDX12.dll, loaded in StartupModule. Note: we no
+	// longer unload it in ShutdownModule (see the comment there). We
+	// only keep this pointer as proof that loading it worked.
 	void* MyDllHandle = nullptr;
 
-	// Full path of the stop file ("%TEMP%\VirtualStudio_SpoutStop" for this
-	// project). Computed once in StartupModule.
+	// Full path of the stop file (for example
+	// "%TEMP%\VirtualStudio_SpoutStop"). Set once in StartupModule.
 	FString StopFilePath;
 
-	// Ticker handle: needed to unregister CheckStopFile in ShutdownModule,
-	// otherwise the engine would call into a module that has already been
-	// destroyed (crash on exit).
+	// Ticker handle. We need this to stop CheckStopFile in
+	// ShutdownModule — otherwise the engine could call a function on a
+	// module that no longer exists, which would crash on exit.
 	FTSTicker::FDelegateHandle StopFileTickerHandle;
 };

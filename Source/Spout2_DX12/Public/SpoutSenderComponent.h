@@ -77,32 +77,29 @@ public:
     TObjectPtr<AActor> TickAfterActor = nullptr;
 
     // ------------------------------------------------------------------
-    // DEFERRED START (fix for the headless GPU crash, 2026-07-03)
+    // WAIT BEFORE START
+    // This fixes a GPU freeze that happened in headless mode (no window).
     //
-    // Root cause: opening the Spout D3D11On12 interop bridge while the
-    // engine is still inside its first frames (map load, PSO precompile
-    // flood, no swapchain pacing the queue in -RenderOffScreen) raced the
-    // D3D12 3D queue and hung the GPU (~3 crashes out of 4 runs,
-    // DXGI_ERROR_DEVICE_HUNG, breadcrumbs always stuck at Frame 0). In a
-    // windowed session the Present paces the queue, so it never showed up.
+    // Problem: if we open the Spout bridge too early, while the engine
+    // is still busy with its first frames, the GPU can freeze. This
+    // only happens with no window (-RenderOffScreen). A normal window
+    // does not have this problem.
     //
-    // Fix: the actual bridge open is HELD until BOTH conditions are true:
-    //   1) world time >= StartDelaySeconds (minimum grace period), AND
-    //   2) engine PSO precaching is idle (no pending precompiles),
-    // with MaxStartDelaySeconds as a hard cap so nothing can hold the
-    // sender back forever. Implemented in StartBroadcastConfigured().
-    // Validated: 4/4 clean 75 s headless runs after the fix.
+    // Fix: we wait to open the bridge until BOTH are true:
+    //   1) StartDelaySeconds of game time has passed, AND
+    //   2) the engine finished compiling its shaders.
+    // MaxStartDelaySeconds is the longest we will ever wait.
+    // The code for this is in StartBroadcastConfigured().
     // ------------------------------------------------------------------
 
-    // Condition 1: minimum world-time grace period. 0 disables the whole
-    // deferral mechanism (start immediately, pre-fix behaviour).
+    // Minimum time to wait. Set to 0 to start right away, like before
+    // this fix.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spout", meta = (ClampMin = "0.0", ToolTip = "Minimum seconds of world time before opening the Spout bridge. The start is additionally held until engine PSO precaching is idle, so heavy scenes wait as long as they need. Opening the D3D11On12 interop during the engine's startup frames can deadlock the D3D12 queue in windowless sessions (-RenderOffScreen). Set to 0 to start immediately."))
     float StartDelaySeconds = 2.0f;
 
-    // Safety valve for condition 2: a scene that keeps PSOs compiling for
-    // a long time must not delay the sender indefinitely. Past this world
-    // time the sender starts even if precaching is still busy (logged as a
-    // Warning). 0 = no cap, wait for PSO idle however long it takes.
+    // Longest time we will wait. If shaders are still compiling after
+    // this time, we start anyway (and log a Warning). Set to 0 for no
+    // limit.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spout", meta = (ClampMin = "0.0", ToolTip = "Safety cap: if PSO precaching is still busy after this many seconds of world time, start anyway so the sender can never be held back forever. Set to 0 to wait for PSO precaching without a cap."))
     float MaxStartDelaySeconds = 15.0f;
 
@@ -211,13 +208,12 @@ private:
         const FString& SenderContext);
     void QueueSendFrame_RenderThread(FTextureRHIRef SrcRHI, int32 W, int32 H, EPixelFormat PF, int32 SlotIndex);
 
-    // Retry timer for the deferred start (see StartDelaySeconds above).
-    // Keeping the handle lets StopBroadcastInternal cancel a pending retry:
-    // without that, stopping the sender during the deferral window would
-    // leave a "zombie" timer that restarts the broadcast on its own.
+    // Timer used for the wait-before-start (see StartDelaySeconds).
+    // We need this so StopBroadcastInternal can stop the timer. If we
+    // don't, the timer could start the broadcast again by itself later.
     FTimerHandle StartDelayTimerHandle;
-    // Log-throttle flag: the "holding sender start" message is emitted only
-    // once per deferral cycle instead of every 0.5 s retry.
+    // Makes sure we log the "waiting to start" message only one time,
+    // not on every retry.
     bool bLoggedStartDeferral = false;
 
     FDelegateHandle GameViewportBackBufferReadyDelegateHandle;

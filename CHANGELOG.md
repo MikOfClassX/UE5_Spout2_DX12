@@ -5,28 +5,25 @@
 Changes ported from the working branch in `VirtualStudio 5.8 5.8 - 2` (based on `37e714e`).
 
 ### Fixed
-- **GPU hang in headless sessions (`-RenderOffScreen`)**: opening the D3D11On12 bridge while the engine is still rendering its first frames or compiling PSOs could deadlock the D3D12 queue (`DXGI_ERROR_DEVICE_HUNG` at Frame 0), since without a swapchain no `Present` paces the queue. Added a "deferred start" to both the sender and the receiver: the actual bridge open is held back until both conditions are true:
-  1. `StartDelaySeconds` of world time have elapsed (default 2.0s, 0 = disable);
-  2. PSO precaching is idle (`PipelineStateCache` + `FShaderPipelineCache` have no pending requests).
-  `MaxStartDelaySeconds` (default 15.0s) acts as a safety valve so the start can never be held back indefinitely.
+- **GPU freeze in headless sessions (`-RenderOffScreen`)**: when running with no window, opening the Spout bridge too early (while the engine was still rendering its first frames or compiling shaders) could freeze the GPU (`DXGI_ERROR_DEVICE_HUNG`). This happened because with no window, nothing was pacing the GPU queue. Fix: both the sender and the receiver now wait before opening the bridge, until both are true:
+  1. At least `StartDelaySeconds` of game time has passed (default 2.0s, set to 0 to disable this wait);
+  2. The engine has finished compiling pending shaders.
+  A safety limit, `MaxStartDelaySeconds` (default 15.0s), makes sure the wait never lasts forever.
   - Files: `SpoutSenderComponent.cpp/h`, `SpoutReceiverComponent.cpp/h`.
 
-- **Shipping shutdown crash**: `ShutdownModule` no longer frees `SpoutDX12.dll` with `FreeDllHandle`. In monolithic Shipping builds, late static destructors could still call into the DLL after it was unloaded, causing an access violation on exit. The DLL stays loaded (the OS reclaims it anyway when the process exits).
+- **Crash on shutdown in Shipping builds**: `ShutdownModule` no longer unloads `SpoutDX12.dll` by hand. In Shipping builds, some code could still call into the DLL right as the app was closing, after the DLL was already unloaded — causing a crash. Now the DLL is simply left loaded; the OS cleans it up when the process exits anyway.
   - File: `Spout2_DX12.cpp`.
 
-- **Link/runtime crash from `Spout.lib`/`Spout.dll`**: `SpoutDX12.dll` already statically embeds the `spoutDX`/`spoutFrameCount` code, so also linking `Spout.lib` made the linker resolve `spoutFrameCount` methods to `Spout.dll` (delay-loaded), which is never actually loaded at runtime by `SpoutDX12.dll` → crash. Removed the link to `Spout.lib` and the delay-load of `Spout.dll`; only `SpoutDX12.lib`/`SpoutDX12.dll` remain.
-  - File: `Spout2_DX12.Build.cs`.
-
-- **Tearing/duplicate frames in the receiver**: added synchronization via Spout's access mutex and frame count (`CreateAccessMutex`/`EnableFrameCount`, `GetNewFrame`, `CheckAccess`/`AllowAccess`) before copying the sender's shared texture, so frames not yet ready are skipped instead of read mid-write. Sync state is reinitialized when the sender name changes and cleared in `StopReceivingInternal`/`ReleaseSpoutDevices`.
+- **Tearing and duplicate frames on the receiver side**: the receiver could sometimes read a frame while the sender was still writing it, causing visual glitches. 
+Fix: added proper synchronization (a lock plus a frame counter) so the receiver waits for a complete frame instead of reading a half-written one. 
+This synchronization state resets whenever the sender name changes, and is cleared when the receiver stops.
   - File: `SpoutReceiverComponent.cpp/h`.
 
 ### Added
-- **Graceful stop channel for headless sessions**: a windowless process has no clean way to be closed from the outside (no `WM_CLOSE`); a `taskkill /F` does not unregister the Spout sender, leaving a "ghost sender" in shared memory that forces the next sender to be renamed (`Sender Component_1`, `_2`, ...), breaking receivers bound to the fixed name. Added a file-based channel: an external tool (e.g. `Ferma_Headless.bat`) creates the file `%TEMP%\<ProjectName>_SpoutStop`; a ticker registered on the core ticker (1s) detects it, deletes it, and calls `RequestEngineExit()` for an orderly shutdown (EndPlay → StopBroadcast → Spout sender release). Active only outside the editor (`GIsEditor` excludes the editor).
+- **A safe way to close headless sessions from outside**: a windowless process has no normal way to be closed cleanly (there's no window to send a "close" message to). Force-killing it (`taskkill /F`) skipped Spout's cleanup, leaving a "ghost" sender behind — 
+which then forced the next run to use a renamed sender (`_1`, `_2`, ...), breaking any receiver expecting the original name. Fix: added a simple file-based signal. An external tool (e.g. `Ferma_Headless.bat`) creates a marker file; the plugin checks for it once per second, and when found, shuts the app down cleanly (including releasing the Spout sender). 
+This only runs outside the Editor.
   - File: `Spout2_DX12.cpp/h`.
 
-### Added
-- **`Build.bat`**: command-line build script wrapping `RunUAT.bat BuildPlugin`, so the plugin can be compiled standalone (Editor, Game Development, Game Shipping, Win64) without opening the Editor. Verified end-to-end against UE 5.8 (`BUILD SUCCESSFUL`, ~2 min).
-- **`BUILD_INSTRUCTIONS.md`**: documents prerequisites, how to run `Build.bat`, the layout of the compiled output folder, and how to install the plugin either into a single project's `Plugins/` folder or engine-wide (`Engine/Plugins/Marketplace/`) so it's available to every project using that Engine install.
-
-### Notes
-- The prebuilt binaries (`Binaries/Win64/*.dll`, `.pdb`) were **not** updated along with the source: they need to be rebuilt in this environment before the next commit/use (`Build.bat` handles this).
+- **`Build.bat`**: a script to compile the plugin from the command line, without opening the Unreal Editor. Tested successfully against UE 5.8 (build succeeds in about 2 minutes).
+- **`BUILD_INSTRUCTIONS.md`**: a guide covering requirements, how to run `Build.bat`, what the compiled output looks like, and how to install the plugin — either into one project's `Plugins/` folder, or engine-wide so every project using that Engine install can see it.
