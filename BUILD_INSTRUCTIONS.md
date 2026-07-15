@@ -43,8 +43,8 @@ Build\Spout2_DX12\
 │   ├── UnrealEditor-Spout2_DX12.dll   <- modulo compilato (Editor)
 │   ├── UnrealEditor-Spout2_DX12.pdb
 │   ├── UnrealEditor.modules
-│   ├── Spout.dll                      <- runtime Spout
-│   └── SpoutDX12.dll                  <- runtime Spout
+│   ├── Spout.dll                      <- runtime Spout (dll spout esterna)
+│   └── SpoutDX12.dll                  <- runtime Spout (dll spout esterna)
 ├── Source\
 │   ├── Spout2_DX12\                   <- sorgenti del modulo plugin (Public/Private + .Build.cs)
 │   └── ThirdParty\                    <- SDK Spout, incluso come sorgente

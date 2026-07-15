@@ -9,6 +9,7 @@ Changes ported from the working branch in `VirtualStudio 5.8 5.8 - 2` (based on 
   1. At least `StartDelaySeconds` of game time has passed (default 2.0s, set to 0 to disable this wait);
   2. The engine has finished compiling pending shaders.
   A safety limit, `MaxStartDelaySeconds` (default 15.0s), makes sure the wait never lasts forever.
+  We need both checks, not just the shader check alone: right after start, the engine may not have asked for any shaders yet, so the shader count can read as 0 too early. The time check is a simple safety net for that gap.
   - Files: `SpoutSenderComponent.cpp/h`, `SpoutReceiverComponent.cpp/h`.
 
 - **Crash on shutdown in Shipping builds**: `ShutdownModule` no longer unloads `SpoutDX12.dll` by hand. In Shipping builds, some code could still call into the DLL right as the app was closing, after the DLL was already unloaded — causing a crash. Now the DLL is simply left loaded; the OS cleans it up when the process exits anyway.
