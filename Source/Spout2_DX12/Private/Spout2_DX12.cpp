@@ -178,6 +178,24 @@ bool FSpout2_DX12Module::CheckStopFile(float DeltaTime)
 // Unreal calls this by itself when the plugin unloads — this happens
 // when the engine closes, or when the plugin module is unloaded during
 // a hot-reload in the editor. We never call this function ourselves.
+//
+// The full chain, when CheckStopFile() triggers RequestEngineExit():
+//   1) The engine finishes the current frame, then starts closing the
+//      game world (UWorld::CleanupWorld() — engine code, not ours).
+//   2) For every Actor in the level, the engine calls AActor::EndPlay().
+//      That Actor code then calls EndPlay() on each of its components,
+//      including ours (USpoutSenderComponent::EndPlay(),
+//      USpoutReceiverComponent::EndPlay()). So an Actor calls our
+//      EndPlay, not the World directly.
+//   3) This is where the Spout sender name is actually removed: inside
+//      the sender's EndPlay -> StopBroadcastInternal() ->
+//      SpoutBridge->ReleaseSender(). The receiver has no name to
+//      remove, it just closes its Spout devices.
+//   4) Only AFTER the whole world is closed does Unreal unload the
+//      plugin modules — this is when ShutdownModule() (this function)
+//      finally runs. By this point Spout is already cleaned up; this
+//      function only stops our stop-file ticker and does NOT touch
+//      Spout at all.
 void FSpout2_DX12Module::ShutdownModule()
 {
 #if PLATFORM_WINDOWS
