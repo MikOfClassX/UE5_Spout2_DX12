@@ -106,6 +106,38 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Spout")
     void SetTickAfterActor(AActor* NewTickAfterActor);
 
+    // ------------------------------------------------------------------
+    // GPU FRAME COMPLETION EVENT (genlock support)
+    //
+    // Problem: a caller that needs to tell an external process "the frame
+    // is ready" has no way to know when the GPU actually finished writing
+    // the shared texture. Everything on the game thread only proves the
+    // work was *queued*, not done, so the external process reads a frame
+    // that is still one behind.
+    //
+    // Fix: we already signal a D3D11 fence right after the copy (see
+    // SignalSubmittedWork). Pass a Win32 event handle here and the GPU
+    // itself signals it via ID3D11Fence::SetEventOnCompletion when it
+    // reaches that fence value. Nothing blocks: no game thread stall, no
+    // frame rate cost, and the event fires exactly when the frame is
+    // really on the shared texture.
+    //
+    // The handle stays owned by the caller: we never close it. Pass
+    // nullptr to detach (default), which restores the previous behaviour
+    // exactly. If a frame is skipped (staging slots still busy) the event
+    // is signaled right away instead, so a waiting process is never left
+    // hanging for a frame that will never be sent.
+    // ------------------------------------------------------------------
+    void SetFrameCompletionEvent(void* EventHandle);
+
+    // True once the bridge is open and frames are actually going out. Note the
+    // start is deferred (see StartDelaySeconds), so this stays false for the
+    // first seconds of a session: a caller relying on the completion event above
+    // must signal by itself while this is false, or it would wait for a frame
+    // the sender is not sending yet.
+    UFUNCTION(BlueprintPure, Category = "Spout")
+    bool IsBroadcasting() const { return bIsBroadcasting; }
+
 protected:
     virtual void OnRegister() override;
     virtual void OnUnregister() override;
@@ -178,6 +210,15 @@ private:
     ID3D11Fence* CopyFence11 = nullptr;
     ID3D11On12Device* CachedD3D11On12 = nullptr;
     uint64 NextFenceValue = 1;
+
+    // Win32 event the GPU signals when it finishes writing a frame, or
+    // null when nobody asked for it. Set through SetFrameCompletionEvent;
+    // owned by the caller, never closed here.
+    void* FrameCompletionEvent = nullptr;
+
+    // Signals FrameCompletionEvent right now, if one is set. Used when a
+    // frame is skipped, so a process waiting on it is not left hanging.
+    void SignalFrameCompletionEventNow();
 #endif
 
     bool bIsBroadcasting = false;

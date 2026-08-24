@@ -660,11 +660,45 @@ bool USpoutSenderComponent::SignalSubmittedWork(int32 SlotIndex)
         StageSlots[SlotIndex].bD3D11FencePending = true;
     }
 
+    // Hand the fence value to the GPU together with the caller's event: the
+    // driver signals it on its own once this copy is really finished, so the
+    // caller learns the frame is on the shared texture without anyone
+    // blocking. See SetFrameCompletionEvent for why this exists.
+    if (FrameCompletionEvent)
+    {
+        const HRESULT eventHr = CopyFence11->SetEventOnCompletion(FenceValue, (HANDLE)FrameCompletionEvent);
+        if (FAILED(eventHr))
+        {
+            UE_LOG(LogSpoutSender, Error, TEXT("SignalSubmittedWork: SetEventOnCompletion failed for fence value %llu. hr=0x%08X. %s"), FenceValue, eventHr, *BuildSenderDebugContext(this));
+
+            // The GPU will never signal it now: fall back to signaling here, or
+            // whoever is waiting would stall until their own timeout.
+            SignalFrameCompletionEventNow();
+        }
+    }
+
     return true;
 #else
     return false;
 #endif
 }
+
+void USpoutSenderComponent::SetFrameCompletionEvent(void* EventHandle)
+{
+#if PLATFORM_WINDOWS
+    FrameCompletionEvent = EventHandle;
+#endif
+}
+
+#if PLATFORM_WINDOWS
+void USpoutSenderComponent::SignalFrameCompletionEventNow()
+{
+    if (FrameCompletionEvent)
+    {
+        ::SetEvent((HANDLE)FrameCompletionEvent);
+    }
+}
+#endif
 
 bool USpoutSenderComponent::IsStageSlotReady_GameThread(int32 SlotIndex) const
 {
@@ -1742,12 +1776,18 @@ void USpoutSenderComponent::UpdateTexture()
             else
             {
                 LogGameViewportFailure(TEXT("UpdateTexture"), TEXT("Both stage slots are still pending; frame send skipped."));
+
+                // No frame goes out this time, so no fence will be armed for it.
+                // Signal now, or a process waiting on the completion event would
+                // stall on a frame that is never coming.
+                SignalFrameCompletionEventNow();
                 return;
             }
         }
         else
         {
             LogGameViewportFailure(TEXT("UpdateTexture"), TEXT("Single-buffer stage slot is still pending; frame send skipped."));
+            SignalFrameCompletionEventNow(); // same as above: nothing sent, unblock the waiter
             return;
         }
     }
