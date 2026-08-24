@@ -106,35 +106,23 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Spout")
     void SetTickAfterActor(AActor* NewTickAfterActor);
 
-    // ------------------------------------------------------------------
-    // GPU FRAME COMPLETION EVENT (genlock support)
-    //
-    // Problem: a caller that needs to tell an external process "the frame
-    // is ready" has no way to know when the GPU actually finished writing
-    // the shared texture. Everything on the game thread only proves the
-    // work was *queued*, not done, so the external process reads a frame
-    // that is still one behind.
-    //
-    // Fix: we already signal a D3D11 fence right after the copy (see
-    // SignalSubmittedWork). Pass a Win32 event handle here and the GPU
-    // itself signals it via ID3D11Fence::SetEventOnCompletion when it
-    // reaches that fence value. Nothing blocks: no game thread stall, no
-    // frame rate cost, and the event fires exactly when the frame is
-    // really on the shared texture.
-    //
-    // The handle stays owned by the caller: we never close it. Pass
-    // nullptr to detach (default), which restores the previous behaviour
-    // exactly. If a frame is skipped (staging slots still busy) the event
-    // is signaled right away instead, so a waiting process is never left
-    // hanging for a frame that will never be sent.
-    // ------------------------------------------------------------------
+    // Win32 event the GPU signals once a frame is really on the shared texture.
+    // Everything on the game thread only proves the work was queued, so a caller
+    // that must tell an external process "frame ready" cannot rely on it. Here we
+    // hand the caller's handle to the D3D11 fence we already signal after the copy
+    // (SignalSubmittedWork), and the driver fires it on completion: nothing blocks,
+    // no frame rate cost. The handle stays the caller's, we never close it.
+    // nullptr (default) restores the previous behaviour exactly.
     void SetFrameCompletionEvent(void* EventHandle);
 
-    // True once the bridge is open and frames are actually going out. Note the
-    // start is deferred (see StartDelaySeconds), so this stays false for the
-    // first seconds of a session: a caller relying on the completion event above
-    // must signal by itself while this is false, or it would wait for a frame
-    // the sender is not sending yet.
+    // Frames dropped because both staging slots were still busy. No fence is armed
+    // for those, so the event above never fires: a caller that waits on it must
+    // poll this to notice and signal by itself. Read it on the game thread after
+    // the sender has ticked.
+    uint64 GetSkippedFrameCount() const { return SkippedFrameCount; }
+
+    // False until the bridge is open (the start is deferred, see StartDelaySeconds):
+    // while false nothing is sent, so no completion event will fire either.
     UFUNCTION(BlueprintPure, Category = "Spout")
     bool IsBroadcasting() const { return bIsBroadcasting; }
 
@@ -211,13 +199,14 @@ private:
     ID3D11On12Device* CachedD3D11On12 = nullptr;
     uint64 NextFenceValue = 1;
 
-    // Win32 event the GPU signals when it finishes writing a frame, or
-    // null when nobody asked for it. Set through SetFrameCompletionEvent;
-    // owned by the caller, never closed here.
+    // Caller's event handle, or null if nobody asked for one. Never closed here.
     void* FrameCompletionEvent = nullptr;
 
-    // Signals FrameCompletionEvent right now, if one is set. Used when a
-    // frame is skipped, so a process waiting on it is not left hanging.
+    // Bumped on the game thread whenever a frame is dropped for lack of a free slot.
+    uint64 SkippedFrameCount = 0;
+
+    // Fires FrameCompletionEvent immediately. Only for when arming the fence failed:
+    // the frame did go out but nothing would ever signal it.
     void SignalFrameCompletionEventNow();
 #endif
 
