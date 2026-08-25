@@ -67,6 +67,51 @@ THIRD_PARTY_INCLUDES_START
 THIRD_PARTY_INCLUDES_END
 #endif
 
+FSpoutSenderFrameTicket::FSpoutSenderFrameTicket(uint64 InSequence)
+    : Sequence(InSequence)
+{
+#if PLATFORM_WINDOWS
+    CompletionEvent = CreateEvent(nullptr, true, false, nullptr);
+#endif
+}
+
+FSpoutSenderFrameTicket::~FSpoutSenderFrameTicket()
+{
+#if PLATFORM_WINDOWS
+    if (CompletionEvent)
+    {
+        CloseHandle(static_cast<HANDLE>(CompletionEvent));
+        CompletionEvent = nullptr;
+    }
+#endif
+}
+
+bool FSpoutSenderFrameTicket::Wait(uint32 TimeoutMilliseconds) const
+{
+#if PLATFORM_WINDOWS
+    return CompletionEvent
+        && WaitForSingleObject(static_cast<HANDLE>(CompletionEvent), TimeoutMilliseconds) == WAIT_OBJECT_0;
+#else
+    return false;
+#endif
+}
+
+void FSpoutSenderFrameTicket::MarkSendSuccessful()
+{
+    bSendSuccessful.Store(true);
+}
+
+void FSpoutSenderFrameTicket::CompleteAsFailed()
+{
+    bSendSuccessful.Store(false);
+#if PLATFORM_WINDOWS
+    if (CompletionEvent)
+    {
+        SetEvent(static_cast<HANDLE>(CompletionEvent));
+    }
+#endif
+}
+
 namespace
 {
     static const TCHAR* GetSenderWorldTypeName(const UWorld* World)
@@ -664,6 +709,60 @@ bool USpoutSenderComponent::SignalSubmittedWork(int32 SlotIndex)
 #else
     return false;
 #endif
+}
+
+void USpoutSenderComponent::CompleteFrameTicket_RenderThread(
+    const TSharedPtr<FSpoutSenderFrameTicket, ESPMode::ThreadSafe>& FrameTicket,
+    bool bSendSucceeded,
+    int32 SlotIndex)
+{
+#if PLATFORM_WINDOWS
+    if (!FrameTicket)
+    {
+        return;
+    }
+
+    if (!bSendSucceeded
+        || SlotIndex < 0
+        || SlotIndex > 1
+        || !CopyFence11
+        || !StageSlots[SlotIndex].bD3D11FencePending
+        || !FrameTicket->GetNativeCompletionEvent())
+    {
+        FrameTicket->CompleteAsFailed();
+        return;
+    }
+
+    // SignalSubmittedWork() inserted this fence after ReleaseWrappedResources()
+    // and the Spout SDK send. The OS event therefore fires only when all D3D11
+    // work for this frame has completed on the shared context.
+    FrameTicket->MarkSendSuccessful();
+    const HRESULT Hr = CopyFence11->SetEventOnCompletion(
+        StageSlots[SlotIndex].D3D11FenceValue,
+        static_cast<HANDLE>(FrameTicket->GetNativeCompletionEvent()));
+    if (FAILED(Hr))
+    {
+        FrameTicket->CompleteAsFailed();
+        UE_LOG(LogSpoutSender, Error,
+            TEXT("CompleteFrameTicket_RenderThread: SetEventOnCompletion failed for slot %d. hr=0x%08X. %s"),
+            SlotIndex,
+            Hr,
+            *BuildSenderDebugContext(this));
+    }
+#else
+    if (FrameTicket)
+    {
+        FrameTicket->CompleteAsFailed();
+    }
+#endif
+}
+
+void USpoutSenderComponent::PruneCompletedFrameTickets_GameThread()
+{
+    PendingFrameTickets.RemoveAll([](const TSharedPtr<FSpoutSenderFrameTicket, ESPMode::ThreadSafe>& Ticket)
+    {
+        return !Ticket || Ticket->Wait(0);
+    });
 }
 
 bool USpoutSenderComponent::IsStageSlotReady_GameThread(int32 SlotIndex) const
@@ -1612,16 +1711,22 @@ bool USpoutSenderComponent::SendFrame_RenderThread(
 #endif
 }
 
-void USpoutSenderComponent::QueueSendFrame_RenderThread(FTextureRHIRef SrcRHI, int32 W, int32 H, EPixelFormat PF, int32 SlotIndex)
+void USpoutSenderComponent::QueueSendFrame_RenderThread(
+    FTextureRHIRef SrcRHI,
+    int32 W,
+    int32 H,
+    EPixelFormat PF,
+    int32 SlotIndex,
+    TSharedPtr<FSpoutSenderFrameTicket, ESPMode::ThreadSafe> FrameTicket)
 {
 #if PLATFORM_WINDOWS
     const bool bLogGameViewport = IsUsingGameViewportSource();
     const FString SenderContext = bLogGameViewport ? BuildSenderDebugContext(this) : FString();
 
     ENQUEUE_RENDER_COMMAND(SpoutSendFrame)(
-        [this, SrcRHI, W, H, PF, SlotIndex, bLogGameViewport, SenderContext](FRHICommandListImmediate& RHICmdList)
+        [this, SrcRHI, W, H, PF, SlotIndex, FrameTicket, bLogGameViewport, SenderContext](FRHICommandListImmediate& RHICmdList)
         {
-            SendFrame_RenderThread(
+            const bool bSent = SendFrame_RenderThread(
                 RHICmdList,
                 SrcRHI,
                 W,
@@ -1633,6 +1738,7 @@ void USpoutSenderComponent::QueueSendFrame_RenderThread(FTextureRHIRef SrcRHI, i
                 false,
                 bLogGameViewport,
                 SenderContext);
+            CompleteFrameTicket_RenderThread(FrameTicket, bSent, SlotIndex);
         });
 #endif
 }
@@ -1685,6 +1791,8 @@ void USpoutSenderComponent::ResetStageSlots()
     }
 
     NextStageSlot = 0;
+    PendingFrameTickets.Reset();
+    LastQueuedFrameTicket.Reset();
 #endif
 }
 
@@ -1752,7 +1860,14 @@ void USpoutSenderComponent::UpdateTexture()
         }
     }
 
-    QueueSendFrame_RenderThread(SrcRHI, W, H, PF, SlotIndex);
+    PruneCompletedFrameTickets_GameThread();
+
+    TSharedPtr<FSpoutSenderFrameTicket, ESPMode::ThreadSafe> FrameTicket =
+        MakeShared<FSpoutSenderFrameTicket, ESPMode::ThreadSafe>(NextFrameTicketSequence++);
+    LastQueuedFrameTicket = FrameTicket;
+    PendingFrameTickets.Add(FrameTicket);
+
+    QueueSendFrame_RenderThread(SrcRHI, W, H, PF, SlotIndex, FrameTicket);
 
     StageSlots[SlotIndex].Fence.BeginFence();
 

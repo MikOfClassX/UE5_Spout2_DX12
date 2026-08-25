@@ -63,7 +63,7 @@ Package the project normally. The plugin stages the required DLLs next to the pa
 
 ### Building from the Command Line
 
-Run `Build.bat` to compile the plugin standalone, without opening the Editor. See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for prerequisites, usage, where the output goes, and how to install it project-wide or engine-wide.
+Run `Build.bat` to compile the plugin standalone, without opening the Editor. `Deploy.bat` installs an existing package into the UE 5.8 Engine Marketplace directory with elevation, validation, backup, and rollback. `BuildAndDeploy.bat` performs the safe clean-package build and deployment in one command. See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for prerequisites and usage.
 
 ---
 
@@ -129,6 +129,7 @@ Run `Build.bat` to compile the plugin standalone, without opening the Editor. Se
 - The runtime override functions are intended for manual runtime control.
 - In v2.1.1, the sender opens Spout DX12 using Unreal's native D3D12 device instead of creating an independent DX12 path.
 - Sender frame handoff now uses D3D11On12 acquire/release and fence tracking before reusing staging slots.
+- Render-target sends expose `GetLastQueuedFrameTicket()`. Its thread-safe ticket sequence identifies the queued frame; `Wait(timeout)` completes after the D3D11 fence inserted after the Spout copy, and `WasSendSuccessful()` reports render-thread send/fence setup success.
 - Packaged Game Viewport sender capture uses render-thread-safe stage-slot readiness while preserving D3D11On12 fence tracking.
 - The sender bridge is opened only when broadcasting starts, reducing editor and PIE bridge churn.
 

@@ -81,13 +81,30 @@ packaging del progetto finale.
 `YourProject\Plugins\Spout2_DX12\`, poi abilitalo da
 **Edit → Plugins → Spout2_DX12**.
 
-**Su tutti i progetti (a livello Engine):** copia lo stesso contenuto in
+**Su tutti i progetti (a livello Engine):** chiudi Unreal Editor e usa il deploy mantenuto:
 
+```bat
+Deploy.bat
 ```
+
+Lo script valida il package esistente in `Build\Spout2_DX12`, richiede automaticamente i privilegi amministrativi, esegue staging e sostituzione completa in:
+
+```text
 C:\Program Files\Epic Games\UE_5.8\Engine\Plugins\Marketplace\Spout2_DX12\
 ```
 
-così ogni `.uproject` aperto con quell'Engine lo vedrà automaticamente in
-**Edit → Plugins**, senza bisogno di averlo nella cartella `Plugins\` del
-progetto. Richiede permessi di scrittura sulla cartella dell'Engine
-(eventualmente esegui da amministratore).
+Confronta hash e albero finale con il package e conserva la versione precedente in `%TEMP%\Spout2_DX12.previous` per il rollback. Non fonde file vecchi nel nuovo plugin.
+
+Dopo una modifica sorgente, il comando raccomandato è:
+
+```bat
+BuildAndDeploy.bat
+```
+
+Questo cancella soltanto il package generato precedente, esegue il `BuildPlugin` completo e distribuisce esclusivamente in caso di build riuscita. Engine e output possono essere sovrascritti con gli stessi due argomenti di `Build.bat`:
+
+```bat
+BuildAndDeploy.bat "D:\Epic Games\UE_5.8" "E:\PluginOutput\Spout2_DX12"
+```
+
+`Deploy.bat` è più rapido ma va usato solo quando il package è già stato rigenerato dalla revisione sorgente desiderata.

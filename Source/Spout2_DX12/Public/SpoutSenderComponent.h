@@ -27,6 +27,31 @@ class SWindow;
 struct FPropertyChangedEvent;
 #endif
 
+// Thread-safe completion ticket for one render-target frame queued by the sender.
+// Wait() completes only after the D3D11 fence inserted after the Spout copy has
+// completed, or immediately when the render-thread send fails.
+class SPOUT2_DX12_API FSpoutSenderFrameTicket
+{
+public:
+    explicit FSpoutSenderFrameTicket(uint64 InSequence);
+    ~FSpoutSenderFrameTicket();
+
+    uint64 GetSequence() const { return Sequence; }
+    bool Wait(uint32 TimeoutMilliseconds) const;
+    bool WasSendSuccessful() const { return bSendSuccessful.Load(); }
+
+private:
+    friend class USpoutSenderComponent;
+
+    void MarkSendSuccessful();
+    void CompleteAsFailed();
+    void* GetNativeCompletionEvent() const { return CompletionEvent; }
+
+    uint64 Sequence = 0;
+    void* CompletionEvent = nullptr;
+    TAtomic<bool> bSendSuccessful{ false };
+};
+
 UCLASS(ClassGroup = (Spout), meta = (BlueprintSpawnableComponent))
 class SPOUT2_DX12_API USpoutSenderComponent : public UActorComponent
 {
@@ -36,6 +61,13 @@ public:
     USpoutSenderComponent();
 
 	void UpdateTexture();
+
+    // Latest render-target frame actually queued to the render thread. The
+    // sequence advances only when QueueSendFrame_RenderThread() is called.
+    TSharedPtr<FSpoutSenderFrameTicket, ESPMode::ThreadSafe> GetLastQueuedFrameTicket() const
+    {
+        return LastQueuedFrameTicket;
+    }
 
     UFUNCTION(BlueprintCallable, Category = "Spout")
     void StartBroadcastFromRenderTarget(
@@ -151,6 +183,11 @@ private:
     bool CacheDX11FenceObjects();
     void ReleaseFenceObjects();
     bool SignalSubmittedWork(int32 SlotIndex);
+    void CompleteFrameTicket_RenderThread(
+        const TSharedPtr<FSpoutSenderFrameTicket, ESPMode::ThreadSafe>& FrameTicket,
+        bool bSendSucceeded,
+        int32 SlotIndex);
+    void PruneCompletedFrameTickets_GameThread();
     bool IsStageSlotReady_GameThread(int32 SlotIndex) const;
     bool IsStageSlotReady_RenderThread(int32 SlotIndex) const;
     static ID3D12Device* GetUE_D3D12Device();
@@ -193,6 +230,10 @@ private:
     mutable EPixelFormat LastLoggedGameViewportFormat = PF_Unknown;
     int32 GameViewportQueuedFrameCount = 0;
 
+    uint64 NextFrameTicketSequence = 1;
+    TSharedPtr<FSpoutSenderFrameTicket, ESPMode::ThreadSafe> LastQueuedFrameTicket;
+    TArray<TSharedPtr<FSpoutSenderFrameTicket, ESPMode::ThreadSafe>> PendingFrameTickets;
+
     void ResetStageSlots();
     bool SendFrame_RenderThread(
         FRHICommandListImmediate& RHICmdList,
@@ -206,7 +247,13 @@ private:
         bool bRestoreSourceState,
         bool bLogGameViewport,
         const FString& SenderContext);
-    void QueueSendFrame_RenderThread(FTextureRHIRef SrcRHI, int32 W, int32 H, EPixelFormat PF, int32 SlotIndex);
+    void QueueSendFrame_RenderThread(
+        FTextureRHIRef SrcRHI,
+        int32 W,
+        int32 H,
+        EPixelFormat PF,
+        int32 SlotIndex,
+        TSharedPtr<FSpoutSenderFrameTicket, ESPMode::ThreadSafe> FrameTicket);
 
     // Timer used for the wait-before-start (see StartDelaySeconds).
     // We need this so StopBroadcastInternal can stop the timer. If we
