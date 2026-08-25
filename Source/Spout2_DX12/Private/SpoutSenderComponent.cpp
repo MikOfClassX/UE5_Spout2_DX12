@@ -660,43 +660,11 @@ bool USpoutSenderComponent::SignalSubmittedWork(int32 SlotIndex)
         StageSlots[SlotIndex].bD3D11FencePending = true;
     }
 
-    // Hand the fence value to the driver along with the caller's event: it fires
-    // on its own once this copy is really done, with nobody blocking.
-    if (FrameCompletionEvent)
-    {
-        const HRESULT eventHr = CopyFence11->SetEventOnCompletion(FenceValue, (HANDLE)FrameCompletionEvent);
-        if (FAILED(eventHr))
-        {
-            UE_LOG(LogSpoutSender, Error, TEXT("SignalSubmittedWork: SetEventOnCompletion failed for fence value %llu. hr=0x%08X. %s"), FenceValue, eventHr, *BuildSenderDebugContext(this));
-
-            // Nothing will ever fire it now, and the frame did go out: signal here
-            // rather than leave the caller waiting for its timeout.
-            SignalFrameCompletionEventNow();
-        }
-    }
-
     return true;
 #else
     return false;
 #endif
 }
-
-void USpoutSenderComponent::SetFrameCompletionEvent(void* EventHandle)
-{
-#if PLATFORM_WINDOWS
-    FrameCompletionEvent = EventHandle;
-#endif
-}
-
-#if PLATFORM_WINDOWS
-void USpoutSenderComponent::SignalFrameCompletionEventNow()
-{
-    if (FrameCompletionEvent)
-    {
-        ::SetEvent((HANDLE)FrameCompletionEvent);
-    }
-}
-#endif
 
 bool USpoutSenderComponent::IsStageSlotReady_GameThread(int32 SlotIndex) const
 {
@@ -1774,18 +1742,12 @@ void USpoutSenderComponent::UpdateTexture()
             else
             {
                 LogGameViewportFailure(TEXT("UpdateTexture"), TEXT("Both stage slots are still pending; frame send skipped."));
-
-                // Nothing goes out, so no fence is armed and the completion event
-                // will not fire. We deliberately do not signal it here: the caller
-                // must first write its own status, then signal in the right order.
-                ++SkippedFrameCount;
                 return;
             }
         }
         else
         {
             LogGameViewportFailure(TEXT("UpdateTexture"), TEXT("Single-buffer stage slot is still pending; frame send skipped."));
-            ++SkippedFrameCount; // same as above
             return;
         }
     }

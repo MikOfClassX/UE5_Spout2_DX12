@@ -106,26 +106,6 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Spout")
     void SetTickAfterActor(AActor* NewTickAfterActor);
 
-    // Win32 event the GPU signals once a frame is really on the shared texture.
-    // Everything on the game thread only proves the work was queued, so a caller
-    // that must tell an external process "frame ready" cannot rely on it. Here we
-    // hand the caller's handle to the D3D11 fence we already signal after the copy
-    // (SignalSubmittedWork), and the driver fires it on completion: nothing blocks,
-    // no frame rate cost. The handle stays the caller's, we never close it.
-    // nullptr (default) restores the previous behaviour exactly.
-    void SetFrameCompletionEvent(void* EventHandle);
-
-    // Frames dropped because both staging slots were still busy. No fence is armed
-    // for those, so the event above never fires: a caller that waits on it must
-    // poll this to notice and signal by itself. Read it on the game thread after
-    // the sender has ticked.
-    uint64 GetSkippedFrameCount() const { return SkippedFrameCount; }
-
-    // False until the bridge is open (the start is deferred, see StartDelaySeconds):
-    // while false nothing is sent, so no completion event will fire either.
-    UFUNCTION(BlueprintPure, Category = "Spout")
-    bool IsBroadcasting() const { return bIsBroadcasting; }
-
 protected:
     virtual void OnRegister() override;
     virtual void OnUnregister() override;
@@ -198,16 +178,6 @@ private:
     ID3D11Fence* CopyFence11 = nullptr;
     ID3D11On12Device* CachedD3D11On12 = nullptr;
     uint64 NextFenceValue = 1;
-
-    // Caller's event handle, or null if nobody asked for one. Never closed here.
-    void* FrameCompletionEvent = nullptr;
-
-    // Bumped on the game thread whenever a frame is dropped for lack of a free slot.
-    uint64 SkippedFrameCount = 0;
-
-    // Fires FrameCompletionEvent immediately. Only for when arming the fence failed:
-    // the frame did go out but nothing would ever signal it.
-    void SignalFrameCompletionEventNow();
 #endif
 
     bool bIsBroadcasting = false;
