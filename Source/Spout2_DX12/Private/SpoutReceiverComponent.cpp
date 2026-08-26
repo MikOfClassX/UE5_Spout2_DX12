@@ -92,9 +92,14 @@ static EPixelFormat MapDxgiToUE(DXGI_FORMAT fmt) {
 	}
 }
 
-// Check if format is sRGB
-static bool IsDXGISRGB(DXGI_FORMAT f) {
-	return f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+// LiveBoard publishes display-ready sRGB video bytes through 8-bit UNORM Spout
+// textures. Treat both the plain and _SRGB DXGI variants as sRGB when Unreal
+// creates or resizes the receiver render target; otherwise a resize changes the
+// target to linear and the ClassX AR1 pass encodes the plate a second time.
+static bool IsLiveBoardSrgbVideoFormat(DXGI_FORMAT f) {
+	return f == DXGI_FORMAT_B8G8R8A8_UNORM ||
+		f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+		f == DXGI_FORMAT_R8G8B8A8_UNORM ||
 		f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
 }
 
@@ -918,7 +923,7 @@ bool USpoutReceiverComponent::EnsureUserOutputRT(uint32 W, uint32 H)
 		return true;
 
 	const EPixelFormat NeededPF = MapDxgiToUE((DXGI_FORMAT)Incoming.Format);
-	const bool bUseLinearGamma = !IsDXGISRGB((DXGI_FORMAT)Incoming.Format);
+	const bool bUseLinearGamma = !IsLiveBoardSrgbVideoFormat((DXGI_FORMAT)Incoming.Format);
 
 	OutputRenderTarget->InitCustomFormat(W, H, NeededPF, bUseLinearGamma);
 	OutputRenderTarget->UpdateResourceImmediate(true);
@@ -941,7 +946,7 @@ bool USpoutReceiverComponent::EnsureInternalRTs(uint32 W, uint32 H)
 
 	// Initialize/resize to match incoming
 	const EPixelFormat NeededPF = MapDxgiToUE((DXGI_FORMAT)Incoming.Format);
-	const bool bUseLinearGamma = !IsDXGISRGB((DXGI_FORMAT)Incoming.Format);
+	const bool bUseLinearGamma = !IsLiveBoardSrgbVideoFormat((DXGI_FORMAT)Incoming.Format);
 
 	auto EnsureOne = [&](UTextureRenderTarget2D* RT)
 		{
@@ -1335,7 +1340,7 @@ bool USpoutReceiverComponent::EnsureGpuRenderTarget(uint32 W, uint32 H, int32 In
 	if (bReinit)
 	{
 		const EPixelFormat NeededPF = MapDxgiToUE((DXGI_FORMAT)Incoming.Format);
-		const bool bUseLinearGamma = !IsDXGISRGB((DXGI_FORMAT)Incoming.Format);
+		const bool bUseLinearGamma = !IsLiveBoardSrgbVideoFormat((DXGI_FORMAT)Incoming.Format);
 
 		TargetRT->InitCustomFormat(W, H, NeededPF, bUseLinearGamma);
 		TargetRT->UpdateResourceImmediate(true);
