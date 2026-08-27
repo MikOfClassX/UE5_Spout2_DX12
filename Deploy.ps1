@@ -81,6 +81,14 @@ try {
 
     Move-Item $stageDir $targetDir
 
+    # The staging tree is created under the elevated user's TEMP directory. A same-volume move
+    # preserves those restrictive ACLs instead of inheriting the Engine plugin directory ACLs,
+    # which can make the deployed plugin unreadable to a normal Unreal Editor process.
+    & icacls.exe $targetDir /inheritance:e /grant '*S-1-5-32-545:(OI)(CI)RX' /T /C | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not grant inherited read/execute access on the deployed plugin (icacls exit code $LASTEXITCODE)."
+    }
+
     foreach ($relativePath in $requiredFiles) {
         $packageHash = (Get-FileHash (Join-Path $PackageDir $relativePath) -Algorithm SHA256).Hash
         $targetHash = (Get-FileHash (Join-Path $targetDir $relativePath) -Algorithm SHA256).Hash

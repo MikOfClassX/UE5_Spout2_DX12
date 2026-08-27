@@ -93,7 +93,7 @@ Lo script valida il package esistente in `Build\Spout2_DX12`, richiede automatic
 C:\Program Files\Epic Games\UE_5.8\Engine\Plugins\Marketplace\Spout2_DX12\
 ```
 
-Confronta hash e albero finale con il package e conserva la versione precedente in `%TEMP%\Spout2_DX12.previous` per il rollback. Non fonde file vecchi nel nuovo plugin.
+Confronta hash e albero finale con il package, ripristina accesso read/execute ereditabile per i normali processi Unreal non elevati e conserva la versione precedente in `%TEMP%\Spout2_DX12.previous` per il rollback. Non fonde file vecchi nel nuovo plugin.
 
 Dopo una modifica sorgente, il comando raccomandato è:
 
