@@ -83,6 +83,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Spout")
 	void StopReceiving();
 
+	// Host capture driver: disables autonomous reception, not component ticking.
+	// Mode changes drain pending receiver work before transferring ownership.
+	SPOUT2_DX12_API void SetCaptureDrivenReceiving(bool bEnabled);
+	SPOUT2_DX12_API bool ReceiveForCapture(int32 TimeoutMilliseconds);
+
 	// Get a list of available Spout senders
 	UFUNCTION(BlueprintCallable, Category = "Spout")
 	TArray<FString> GetAvailableSenders() const;
@@ -139,6 +144,32 @@ private:
     void RefreshEditorState();
     void InitializeDesiredState();
     void StopReceivingInternal(bool bClearDesiredState);
+
+	// Opt-in game-thread diagnostics. Counters are observations, not pixel identity.
+	struct FReceiverTraceRecord
+	{
+		double Seconds = 0.0;
+		uint64 EngineFrame = 0;
+		const TCHAR* Event = nullptr;
+		int64 ObservedSenderFrame = -1;
+		uint64 Fence = 0;
+		uint64 CompletedFence = 0;
+		int32 Slot = INDEX_NONE;
+		int32 SourceEpoch = 0;
+		float DeltaSeconds = 0.0f;
+		float Accumulator = 0.0f;
+	};
+	TArray<FReceiverTraceRecord> ReceiverTrace;
+	bool bReceiverTraceActive = false;
+	bool bReceiverTraceArmed = true;
+	double ReceiverTraceStart = 0.0;
+	double ReceiverTraceDuration = 0.0;
+	float ReceiverTraceDeltaSeconds = 0.0f;
+	int64 ReceiverTraceObservedFrame = -1;
+	int32 ReceiverTraceSourceEpoch = 0;
+	void UpdateReceiverTrace(float DeltaSeconds);
+	void RecordReceiverTrace(const TCHAR* Event, int32 Slot = INDEX_NONE, uint64 Fence = 0);
+	void DumpReceiverTrace(const TCHAR* Reason);
 
 	// Spout objects
 	spoutDX* SpoutInfo = nullptr;
@@ -224,6 +255,16 @@ private:
 	#endif
 
 	bool bPendingOneShotStop = false;
+	bool bCaptureDrivenReceiving = false;
+	bool bNewFramePendingCopy = false;
+	bool bRetryableReceiveFailure = false;
+	uint64 CapturePendingFence = 0;
+	bool bReceiverCopyWorkPending = false;
+	bool bReceiverDeviceLost = false;
+	bool bDrainFailureLogged = false;
+	bool bSourceUnavailableLogged = false;
+	bool DrainReceiverCopies();
+	bool WaitForCaptureFence(double Deadline);
 
 	// Spout frame sync state
 	bool bSyncInitialized = false;

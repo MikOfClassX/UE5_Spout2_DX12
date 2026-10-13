@@ -186,6 +186,42 @@ Run `Build.bat` to compile the plugin standalone, without opening the Editor. `D
 - `MissedFrames`
   Number of missed frames during the current session.
 
+### Opt-in Receiver Frame Trace
+
+For intermittent repeated/skipped frames, enter this in the Unreal console while the receiver is running:
+
+```text
+Spout.RX.TraceSeconds 15
+```
+
+Each ticking receiver captures up to 65,536 records in preallocated memory (maximum duration 120 real seconds). It automatically writes a uniquely named CSV into the host project's `Saved/SpoutDiagnostics/` on expiry, capacity, receiver stop, or disable. The `LogSpoutRX` start/end messages identify the component, initial sender/settings, and file. There are no per-frame log messages or disk writes. Allocation/start logging and the final synchronous CSV dump can perturb timing at the capture boundaries; exclude those boundaries when reviewing video.
+
+To capture again, set `Spout.RX.TraceSeconds 0`, allow a receiver tick, then set it positive again. The setting applies to all receivers, including supported editor worlds. It does not change reception rate, buffering, mutex behavior, or GPU synchronization.
+
+CSV events include:
+
+- `Tick`, `ThrottleSkip`, `ReceiveAttempt`, `ReceiveOK`, `ReceiveFailed`: receiver scheduling and overall attempt result. `ReceiveOK` means submission succeeded, not GPU completion.
+- `NewFrame`, `NoNewFrame`: the existing `GetNewFrame()` check, followed by the SDK's cached `GetSenderFrame()` value. No extra frame-counter polling is introduced.
+- `FirstFrameUncounted`: initial/reconnection copy bypassed that check. Count `-1` also means unavailable/disabled or not yet observed in this trace.
+- `MutexAcquired`, `MutexMiss`, `SnapshotQueuedMutexReleased`: shared-source access and asynchronous snapshot submission.
+- `CopySubmitted`: signaled copy fence (slot `-1` means direct output, `0`/`1` means internal double-buffer slot).
+- `PublishEnqueued`: double-buffer output copy was queued; **not** proof that Unreal's output copy or camera sampling completed. Match its fence to the earlier `CopySubmitted` record; its sender-count column is only the latest observation, not the published slot's pixel identity.
+- `SourceSyncReset`: source synchronization was reinitialized; compare counts only within one `source_epoch`.
+
+Other columns record real elapsed time, Unreal `GFrameCounter`, observed D3D11 completed-fence value, tick delta and FPS accumulator. Count deltas greater than one show missed observed publications, not their cause. A new count followed by `MutexMiss` identifies an observed update that was not copied on that attempt. `ThrottleSkip` can be normal when Unreal ticks faster than the receiver's target rate.
+
+The SDK count is not necessarily the video's burned-in counter or a host genlock ID. Keep the continuous visual counter and original recording alongside the CSV and Unreal log. This receiver-only trace does not read shared memory, identify camera consumption, or prove which pixels were copied; GPU-completion and camera-ordering investigations may require additional correlation. Frame counting must be supported/enabled by the Spout sender/SDK for meaningful counts.
+
+### Capture-Driven Reception
+
+A host can call `SetCaptureDrivenReceiving(true)` to suppress autonomous receiver reception, then call the exported game-thread `ReceiveForCapture(TimeoutMilliseconds)` immediately before capture. The default is autonomous reception. The capture-driven path requires a running receiver, enabled Spout frame counting and direct output (no double buffering). It bypasses FPS throttling, retries new-frame/access checks, retains observed updates across access failures, flushes D3D11 submission and waits for receiver-copy fence completion. The 1–100 ms budget bounds polling, not SDK calls/resource initialization. Exit requests break polling. `false` requires the host to skip sampling the destination, since a GPU write may remain pending; the next capture-driven call first waits for that pending fence. Mode/source/resource changes and teardown drain submitted work using a GPU event query (up to 1000 ms polling), including unfenced failed submissions. Failed drain retains resources instead of releasing/reusing them unsafely; destruction on a wedged GPU can retain native allocations. Polling backs off 1 ms; device-removal fence values are failure, not completion.
+
+This does not establish producer GPU completion or exact image/camera matching, and does not redesign shared-source mutex/copy ordering. ClassX integrates this path through persistent **Project Settings → Plugins → ClassX Capture**, enabled by default with a 20 ms polling budget. `ClassX.SpoutCaptureSyncMs` defaults to -1 (follow project settings); 0 disables; positive values override the budget. Only authority Virtual1/AR1 captures with consumed requests wait. Its timeout skips capture but the existing output sender can still acknowledge prior output. Do not treat this as a new fresh-input protocol guarantee.
+
+Source changes and stop/restart disconnect the frame counter with `CleanupFrameCount()`, not `DisableFrameCount()`: the latter latches SDK counting off and `EnableFrameCount()` does not undo it. The `Spout.Receiver.Sync.FrameCountLifecycle` test exercises counter retargeting/reopen and the Disable/Enable pitfall without changing registry settings.
+
+Diagnostic CSV adds `CaptureWaitBegin`, `CaptureReady`, `CaptureNewFrameTimeout`, `CaptureGpuTimeout`, `CaptureReceiveError`, `CaptureFrameCountUnavailable`, and `CaptureDeviceRemoved`. Retry `NoNewFrame` checks within the same Unreal frame are expected in this mode. Capture-ready means receiver fence completion, not producer completion or pixel identity.
+
 ### Receiver Screenshots
 
 ![Receiver Functions And Settings](SpoutSS/ReceiverFunctionsAndSettings.png)

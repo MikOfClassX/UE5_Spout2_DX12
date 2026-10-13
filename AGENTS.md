@@ -56,7 +56,7 @@ If Git reports dubious ownership for this known checkout, use a command-scoped e
 | `README.md`, `LICENSE`, `CODE_OF_CONDUCT.md` | User documentation, repository MIT license, and community policy. Preserve vendor license notices separately. |
 | `local plans.md` | Git-ignored local feature plans, decisions, reproduction notes, and verification results. |
 
-There is currently no tracked automated test suite, CI workflow, build wrapper, or sample host project. Do not invent existing test commands or treat a shipped DLL as a fresh build result.
+A focused receiver fence-policy Automation test is tracked; there is no comprehensive automated suite, CI workflow, or sample host project. Maintained build/deploy wrappers are documented in README and BUILD_INSTRUCTIONS.md. Do not invent existing test commands or treat a shipped DLL as a fresh build result.
 
 ## Build dependencies and DLL flow
 
@@ -104,6 +104,8 @@ TickComponent -> ReceiveOnce -> sender metadata/share handle
 ```
 
 Without double buffering, the wrapped destination is `OutputRenderTarget`. With double buffering, reception alternates `InternalRT_A` / `InternalRT_B`; `PublishCompletedInternalBuffer` selects the newest completed fence and enqueues a copy to `OutputRenderTarget`. Preserve the user-facing render target object so materials and Blueprint references remain valid.
+
+Host capture-driven reception uses `SetCaptureDrivenReceiving` and exported `ReceiveForCapture` on the game thread. It bypasses autonomous throttling, requires frame counting/direct output, retains counted updates until copy submission, and gates sampling on receiver-copy completion. Polling backs off 1 ms; UINT64_MAX means device removal. Mode/source/resource changes and teardown drain via a D3D11 event query, covering unfenced failed copies. Failed drains retain native resources and refuse reuse; a wedged GPU can leave native allocations retained at destruction. This is not producer GPU completion or exact image/camera identity. Opt-in bounded CSV diagnostics remain disabled by default.
 
 `MapDxgiToUE` explicitly maps BGRA8/RGBA8 (including sRGB variants), RGBA16F, RGBA32F, and RGB10A2. Its default maps to BGRA8 with a warning; this is not a general pixel-format conversion pipeline. Audit size, format, gamma, sample count, and native-resource identity when touching copies or resize handling.
 
@@ -189,7 +191,7 @@ Choose validation based on the change:
 
 For broad rendering/lifecycle changes, cover render-target sending, editor viewport, PIE game viewport, standalone/packaged game viewport, and receiving. Include missing/null sources, absent senders, repeated start/stop, level changes, component destruction, viewport resize/minimize, and shutdown. Verify colors, alpha/gamma where applicable, frame continuity, and lack of stale sender registrations or growing resource usage. A sender listing alone does not prove correct frame delivery.
 
-There are no existing automated tests to run. Add focused tests when introducing independently testable policy/state logic or fixing a regression that can be reproduced automatically. Hardware interop still needs runtime evidence. If the engine, host project, GPU access, or peer Spout app is unavailable, state exactly what was inspected and what remains unverified.
+`Spout.Receiver.Sync.FencePolicy` covers fence classification (including device removal). `Spout.Receiver.Sync.FrameCountLifecycle` uses the real SDK to exercise counter retarget/reopen and verify that Disable/Enable is not a disconnect/reconnect pair, without changing registry settings. These tests do not cover GPU video interop. Add focused tests when introducing independently testable policy/state logic or fixing a regression that can be reproduced automatically. Hardware interop still needs runtime evidence. If the engine, host project, GPU access, or peer Spout app is unavailable, state exactly what was inspected and what remains unverified.
 
 ## Existing caveats to investigate when relevant
 

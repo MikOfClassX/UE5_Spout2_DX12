@@ -13,6 +13,23 @@
 #include "ShaderPipelineCache.h"
 #include "Engine/World.h"
 #include "UObject/UnrealType.h"
+#include "HAL/IConsoleManager.h"
+#include "HAL/FileManager.h"
+#include "HAL/PlatformProcess.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Misc/Guid.h"
+#include "CoreGlobals.h"
+#include "SpoutReceiverSyncPolicy.h"
+
+namespace
+{
+	TAutoConsoleVariable<float> CVarSpoutReceiverTraceSeconds(
+		TEXT("Spout.RX.TraceSeconds"), 0.0f,
+		TEXT("Capture a bounded receiver CSV for this many real seconds (max 120). Set 0 then positive to rearm. Writes Saved/SpoutDiagnostics."),
+		ECVF_Default);
+	constexpr int32 MaxReceiverTraceRecords = 65536;
+}
 
 #if PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -333,6 +350,95 @@ void USpoutReceiverComponent::BeginPlay()
 #endif
 }
 
+void USpoutReceiverComponent::UpdateReceiverTrace(float DeltaSeconds)
+{
+	ReceiverTraceDeltaSeconds = DeltaSeconds;
+	const float RequestedSeconds = CVarSpoutReceiverTraceSeconds.GetValueOnGameThread();
+	if (RequestedSeconds <= 0.0f)
+	{
+		DumpReceiverTrace(TEXT("disabled"));
+		bReceiverTraceArmed = true;
+		return;
+	}
+	if (bReceiverTraceActive)
+	{
+		if (ReceiverTrace.Num() == MaxReceiverTraceRecords)
+		{
+			DumpReceiverTrace(TEXT("capacity"));
+		}
+		else if (FPlatformTime::Seconds() - ReceiverTraceStart >= ReceiverTraceDuration)
+		{
+			DumpReceiverTrace(TEXT("duration"));
+		}
+		return;
+	}
+	if (!bReceiverTraceArmed)
+	{
+		return;
+	}
+	bReceiverTraceArmed = false;
+	ReceiverTrace.Reset();
+	ReceiverTrace.Reserve(MaxReceiverTraceRecords);
+	ReceiverTraceObservedFrame = -1;
+	ReceiverTraceStart = FPlatformTime::Seconds();
+	ReceiverTraceDuration = FMath::Clamp(static_cast<double>(RequestedSeconds), 0.1, 120.0);
+	bReceiverTraceActive = true;
+	UE_LOG(LogSpoutRX, Display, TEXT("Receiver trace started: %s, %.1fs, FPS=%d doubleBuffer=%d sender='%s'"),
+		*GetPathName(), ReceiverTraceDuration, TargetFPS, bUseDoubleBuffer ? 1 : 0, ANSI_TO_TCHAR(SpoutSyncName));
+	RecordReceiverTrace(TEXT("Begin"));
+}
+
+void USpoutReceiverComponent::RecordReceiverTrace(const TCHAR* Event, int32 Slot, uint64 Fence)
+{
+	if (!bReceiverTraceActive)
+	{
+		return;
+	}
+	if (ReceiverTrace.Num() == MaxReceiverTraceRecords)
+	{
+		// Freeze at capacity; dump on the next tick, never while holding Spout access.
+		return;
+	}
+	FReceiverTraceRecord& Record = ReceiverTrace.AddDefaulted_GetRef();
+	Record.Seconds = FPlatformTime::Seconds() - ReceiverTraceStart;
+	Record.EngineFrame = GFrameCounter;
+	Record.Event = Event;
+	Record.ObservedSenderFrame = ReceiverTraceObservedFrame;
+	Record.Fence = Fence;
+#if PLATFORM_WINDOWS
+	Record.CompletedFence = CopyFence11 ? CopyFence11->GetCompletedValue() : 0;
+#endif
+	Record.Slot = Slot;
+	Record.SourceEpoch = ReceiverTraceSourceEpoch;
+	Record.DeltaSeconds = ReceiverTraceDeltaSeconds;
+	Record.Accumulator = TickAccumulator;
+}
+
+void USpoutReceiverComponent::DumpReceiverTrace(const TCHAR* Reason)
+{
+	if (!bReceiverTraceActive)
+	{
+		return;
+	}
+	bReceiverTraceActive = false;
+	// Format/write only after capture, never on the steady-state frame path.
+	FString CSV(TEXT("seconds,engine_frame,event,source_epoch,observed_sender_frame,slot,submitted_fence,completed_fence,delta_seconds,accumulator\n"));
+	CSV.Reserve(ReceiverTrace.Num() * 160);
+	for (const FReceiverTraceRecord& Record : ReceiverTrace)
+	{
+		CSV += FString::Printf(TEXT("%.9f,%llu,%s,%d,%lld,%d,%llu,%llu,%.9f,%.9f\n"),
+			Record.Seconds, Record.EngineFrame, Record.Event, Record.SourceEpoch, Record.ObservedSenderFrame,
+			Record.Slot, Record.Fence, Record.CompletedFence, Record.DeltaSeconds, Record.Accumulator);
+	}
+	const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("SpoutDiagnostics"));
+	const FString File = FPaths::Combine(Directory, FString::Printf(TEXT("Receiver-%s.csv"), *FGuid::NewGuid().ToString()));
+	const bool bSaved = IFileManager::Get().MakeDirectory(*Directory, true)
+		&& FFileHelper::SaveStringToFile(CSV, *File, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+	UE_LOG(LogSpoutRX, Display, TEXT("Receiver trace %s: %s, reason=%s records=%d file='%s'"),
+		bSaved ? TEXT("saved") : TEXT("SAVE FAILED"), *GetPathName(), Reason, ReceiverTrace.Num(), *File);
+	ReceiverTrace.Empty();
+}
+
 void USpoutReceiverComponent::ResetStats()
 {
 	CopiesPerSecond = 0.0f;
@@ -459,6 +565,8 @@ void USpoutReceiverComponent::ReleaseFenceObjects()
 
 	NextFenceValue = 1;
 	LastPublishedFenceValue = 0;
+	CapturePendingFence = 0;
+	bNewFramePendingCopy = false;
 
 	for (int32 i = 0; i < 2; ++i)
 	{
@@ -485,6 +593,8 @@ bool USpoutReceiverComponent::SignalSubmittedWork(int32 TrackedSlotIndex)
 		return false;
 	}
 
+	RecordReceiverTrace(TEXT("CopySubmitted"), TrackedSlotIndex, FenceValue);
+
 	if (TrackedSlotIndex == 0 || TrackedSlotIndex == 1)
 	{
 		SlotFenceState[TrackedSlotIndex].FenceValue = FenceValue;
@@ -506,6 +616,11 @@ void USpoutReceiverComponent::PublishCompletedInternalBuffer()
 	}
 
 	const uint64 CompletedValue = CopyFence11->GetCompletedValue();
+	if (CompletedValue == MAX_uint64)
+	{
+		bReceiverDeviceLost = true;
+		return;
+	}
 
 	int32 BestIndex = INDEX_NONE;
 	uint64 BestFenceValue = LastPublishedFenceValue;
@@ -556,6 +671,7 @@ void USpoutReceiverComponent::PublishCompletedInternalBuffer()
 			}
 		});
 
+	RecordReceiverTrace(TEXT("PublishEnqueued"), BestIndex, BestFenceValue);
 	LastPublishedFenceValue = BestFenceValue;
 
 	for (int32 i = 0; i < 2; ++i)
@@ -600,6 +716,14 @@ void USpoutReceiverComponent::TickComponent(float DeltaTime, enum ELevelTick Tic
 	if (!bReceiving)
 		return;
 
+	UpdateReceiverTrace(DeltaTime);
+	RecordReceiverTrace(TEXT("Tick"));
+	if (bCaptureDrivenReceiving || bReceiverDeviceLost)
+	{
+		// The owning capture explicitly receives immediately before sampling the plate.
+		return;
+	}
+
 	// Poll fence completion every tick and publish completed internal buffer if ready.
 	PublishCompletedInternalBuffer();
 
@@ -609,7 +733,10 @@ void USpoutReceiverComponent::TickComponent(float DeltaTime, enum ELevelTick Tic
 		// submit one frame, then stop only after PublishCompletedInternalBuffer() sees it complete.
 		if (!bPendingOneShotStop)
 		{
-			if (ReceiveOnce())
+			RecordReceiverTrace(TEXT("ReceiveAttempt"));
+			const bool bReceived = ReceiveOnce();
+			RecordReceiverTrace(bReceived ? TEXT("ReceiveOK") : TEXT("ReceiveFailed"));
+			if (bReceived)
 			{
 				bPendingOneShotStop = true;
 			}
@@ -621,12 +748,17 @@ void USpoutReceiverComponent::TickComponent(float DeltaTime, enum ELevelTick Tic
 
 	TickAccumulator += DeltaTime;
 	if (TickAccumulator < TargetInterval)
+	{
+		RecordReceiverTrace(TEXT("ThrottleSkip"));
 		return;
+	}
 
 	// Keep remainder to reduce jitter.
 	TickAccumulator -= TargetInterval;
 
-	ReceiveOnce();
+	RecordReceiverTrace(TEXT("ReceiveAttempt"));
+	const bool bReceived = ReceiveOnce();
+	RecordReceiverTrace(bReceived ? TEXT("ReceiveOK") : TEXT("ReceiveFailed"));
 
 	// Poll again in case the previous slot completed by now.
 	PublishCompletedInternalBuffer();
@@ -637,6 +769,15 @@ void USpoutReceiverComponent::TickComponent(float DeltaTime, enum ELevelTick Tic
 // Start receiving from Spout sender.
 void USpoutReceiverComponent::StartReceiving()
 {
+	// A failed stop retains resources until GPU work can be drained safely.
+	if (bReceiverCopyWorkPending)
+	{
+		if (!DrainReceiverCopies())
+		{
+			return;
+		}
+		StopReceivingInternal(false);
+	}
 	if (!IsSupportedWorld())
 	{
 		return;
@@ -832,6 +973,8 @@ void USpoutReceiverComponent::StartReceiving()
 	}
 
 	// Mark receiver as running.
+	bReceiverDeviceLost = false;
+	bNewFramePendingCopy = false;
 	bReceiving = true;
 	SetComponentTickEnabled(true);
 	UE_LOG(LogSpoutRX, Display, TEXT("Spout receiver started @ %d FPS"), TargetFPS);
@@ -845,6 +988,8 @@ void USpoutReceiverComponent::StopReceiving()
 
 void USpoutReceiverComponent::StopReceivingInternal(bool bClearDesiredState)
 {
+	RecordReceiverTrace(TEXT("Stop"));
+	DumpReceiverTrace(TEXT("stop"));
 	// Stop the wait-before-start timer if it is still running (see
 	// StartReceiving). If we don't, the timer could start the receiver
 	// again later, even after we already stopped it. Also reset the
@@ -867,6 +1012,14 @@ void USpoutReceiverComponent::StopReceivingInternal(bool bClearDesiredState)
 #if PLATFORM_WINDOWS
 	FlushRenderingCommands();
 #endif
+	if (!DrainReceiverCopies())
+	{
+		// Fail closed: retain native resources, never release an in-flight destination.
+		bConnected = false;
+		return;
+	}
+	bNewFramePendingCopy = false;
+	bRetryableReceiveFailure = false;
 	
 	// Release resources and close Spout devices.
 	for (int i = 0; i < 2; ++i)
@@ -901,7 +1054,8 @@ void USpoutReceiverComponent::StopReceivingInternal(bool bClearDesiredState)
 		if (bSyncInitialized)
 		{
 			SpoutDX12->frame.CloseAccessMutex();
-			SpoutDX12->frame.DisableFrameCount();
+			// Disconnect handles without latching SDK frame counting off across restart.
+			SpoutDX12->frame.CleanupFrameCount();
 		}
 		SpoutDX12->ReleaseReceiver();
 		SpoutDX12->CloseDirectX12();
@@ -922,6 +1076,7 @@ bool USpoutReceiverComponent::EnsureUserOutputRT(uint32 W, uint32 H)
 	if ((uint32)OutputRenderTarget->SizeX == W && (uint32)OutputRenderTarget->SizeY == H)
 		return true;
 
+	if (!DrainReceiverCopies()) return false;
 	const EPixelFormat NeededPF = MapDxgiToUE((DXGI_FORMAT)Incoming.Format);
 	const bool bUseLinearGamma = !IsLiveBoardSrgbVideoFormat((DXGI_FORMAT)Incoming.Format);
 
@@ -937,6 +1092,11 @@ bool USpoutReceiverComponent::EnsureInternalRTs(uint32 W, uint32 H)
 {
 	if (!bUseDoubleBuffer)
 		return true;
+	if ((InternalRT_A && (InternalRT_A->SizeX != static_cast<int32>(W) || InternalRT_A->SizeY != static_cast<int32>(H)))
+		|| (InternalRT_B && (InternalRT_B->SizeX != static_cast<int32>(W) || InternalRT_B->SizeY != static_cast<int32>(H))))
+	{
+		if (!DrainReceiverCopies()) return false;
+	}
 
 	if (!InternalRT_A)
 		InternalRT_A = NewObject<UTextureRenderTarget2D>(this);
@@ -996,6 +1156,12 @@ bool USpoutReceiverComponent::InitSpoutDevices()
 // Release resources and delete Spout objects.
 void USpoutReceiverComponent::ReleaseSpoutDevices()
 {
+	if (!DrainReceiverCopies())
+	{
+		// On destruction, intentionally retain native allocations on a wedged GPU.
+		// There are no callbacks into this component; releasing them would be unsafe.
+		return;
+	}
 	for (int i = 0; i < 2; ++i)
 	{
 		if (Incoming.WrappedDest11[i])
@@ -1032,7 +1198,7 @@ void USpoutReceiverComponent::ReleaseSpoutDevices()
 		if (bSyncInitialized)
 		{
 			SpoutDX12->frame.CloseAccessMutex();
-			SpoutDX12->frame.DisableFrameCount();
+			SpoutDX12->frame.CleanupFrameCount();
 		}
 		SpoutDX12->ReleaseReceiver();
 		SpoutDX12->CloseDirectX12();
@@ -1050,9 +1216,181 @@ void USpoutReceiverComponent::ReleaseSpoutDevices()
 	}
 }
 
+bool USpoutReceiverComponent::DrainReceiverCopies()
+{
+#if PLATFORM_WINDOWS
+	if (!bReceiverCopyWorkPending)
+	{
+		return true;
+	}
+	ID3D11Device* Device = SpoutDX12 ? SpoutDX12->GetD3D11device() : nullptr;
+	ID3D11DeviceContext* Context = SpoutDX12 ? SpoutDX12->GetD3D11context() : nullptr;
+	if (bReceiverDeviceLost || (Device && FAILED(Device->GetDeviceRemovedReason())))
+	{
+		bReceiverDeviceLost = true;
+		bReceiverCopyWorkPending = false;
+		CapturePendingFence = 0;
+		return true; // Removed devices cannot continue executing pending work.
+	}
+	// An event query also covers copy work whose fence signal failed.
+	D3D11_QUERY_DESC Desc{};
+	Desc.Query = D3D11_QUERY_EVENT;
+	ComPtr<ID3D11Query> Query;
+	if (Device && Context && SUCCEEDED(Device->CreateQuery(&Desc, Query.GetAddressOf())))
+	{
+		Context->End(Query.Get());
+		Context->Flush();
+		const double Deadline = FPlatformTime::Seconds() + 1.0;
+		while (FPlatformTime::Seconds() < Deadline)
+		{
+			BOOL Complete = 0;
+			const HRESULT Result = Context->GetData(Query.Get(), &Complete, sizeof(Complete), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+			if (Result == S_OK && Complete)
+			{
+				bReceiverCopyWorkPending = false;
+				CapturePendingFence = 0;
+				bDrainFailureLogged = false;
+				return true;
+			}
+			if (FAILED(Device->GetDeviceRemovedReason()))
+			{
+				bReceiverDeviceLost = true;
+				bReceiverCopyWorkPending = false;
+				CapturePendingFence = 0;
+				return true;
+			}
+			if (FAILED(Result))
+			{
+				break;
+			}
+			FPlatformProcess::SleepNoStats(0.001f);
+		}
+	}
+	if (!bDrainFailureLogged)
+	{
+		UE_LOG(LogSpoutRX, Error, TEXT("Receiver GPU drain failed/timed out; retaining resources and refusing reuse until drained or device removed."));
+		bDrainFailureLogged = true;
+	}
+	bReceiving = false;
+	bConnected = false;
+	return false;
+#else
+	return true;
+#endif
+}
+
+void USpoutReceiverComponent::SetCaptureDrivenReceiving(bool bEnabled)
+{
+	check(IsInGameThread());
+	if (bCaptureDrivenReceiving == bEnabled)
+	{
+		return;
+	}
+	if (!DrainReceiverCopies())
+	{
+		// Receiver is stopped; remember the requested mode without retrying a 1s drain every tick.
+		bCaptureDrivenReceiving = bEnabled;
+		return;
+	}
+	bCaptureDrivenReceiving = bEnabled;
+	bNewFramePendingCopy = false;
+	TickAccumulator = 0.0f;
+}
+
+bool USpoutReceiverComponent::WaitForCaptureFence(double Deadline)
+{
+#if PLATFORM_WINDOWS
+	if (!CapturePendingFence)
+	{
+		return !bReceiverCopyWorkPending; // Untracked failed submission requires stop/drain.
+	}
+	while (CopyFence11)
+	{
+		const ESpoutReceiverFenceStatus Status = GetSpoutReceiverFenceStatus(CopyFence11->GetCompletedValue(), CapturePendingFence);
+		if (Status == ESpoutReceiverFenceStatus::DeviceRemoved)
+		{
+			bReceiverDeviceLost = true;
+			RecordReceiverTrace(TEXT("CaptureDeviceRemoved"));
+			return false;
+		}
+		if (Status == ESpoutReceiverFenceStatus::Ready)
+		{
+			bReceiverCopyWorkPending = false;
+			return true;
+		}
+		if (FPlatformTime::Seconds() >= Deadline || IsEngineExitRequested())
+		{
+			RecordReceiverTrace(TEXT("CaptureGpuTimeout"), INDEX_NONE, CapturePendingFence);
+			return false;
+		}
+		FPlatformProcess::SleepNoStats(0.001f);
+	}
+#endif
+	return false;
+}
+
+// Game-thread receive driven by a host capture, not the FPS accumulator.
+bool USpoutReceiverComponent::ReceiveForCapture(int32 TimeoutMilliseconds)
+{
+	check(IsInGameThread());
+#if PLATFORM_WINDOWS
+	if (!bCaptureDrivenReceiving || !bReceiving || bUseDoubleBuffer || !SpoutDX12 || bReceiverDeviceLost
+		|| IsEngineExitRequested())
+	{
+		return false;
+	}
+	const double Deadline = FPlatformTime::Seconds() + FMath::Clamp(TimeoutMilliseconds, 1, 100) * 0.001;
+	RecordReceiverTrace(TEXT("CaptureWaitBegin"));
+	// A previous GPU timeout must not allow the destination to be overwritten while pending.
+	if (!WaitForCaptureFence(Deadline))
+	{
+		return false;
+	}
+	CapturePendingFence = 0;
+	bool bReceived = false;
+	do
+	{
+		if (IsEngineExitRequested())
+		{
+			return false;
+		}
+		RecordReceiverTrace(TEXT("ReceiveAttempt"));
+		bReceived = ReceiveOnce();
+		if (bReceived)
+		{
+			break;
+		}
+		if (!bRetryableReceiveFailure)
+		{
+			RecordReceiverTrace(TEXT("CaptureReceiveError"));
+			return false;
+		}
+		FPlatformProcess::SleepNoStats(0.001f);
+	} while (FPlatformTime::Seconds() < Deadline);
+	if (!bReceived)
+	{
+		RecordReceiverTrace(TEXT("CaptureNewFrameTimeout"));
+		return false;
+	}
+	CapturePendingFence = NextFenceValue - 1;
+	// Signal is asynchronous. Submit D3D11On12 work before polling for completion.
+	SpoutDX12->GetD3D11context()->Flush();
+	if (!WaitForCaptureFence(Deadline))
+	{
+		return false;
+	}
+	RecordReceiverTrace(TEXT("CaptureReady"), INDEX_NONE, CapturePendingFence);
+	CapturePendingFence = 0;
+	return CopyFence11 != nullptr;
+#else
+	return false;
+#endif
+}
+
 // Receive one frame and copy it to UE render target.
 bool USpoutReceiverComponent::ReceiveOnce()
 {
+	bRetryableReceiveFailure = false;
 	UE_LOG(LogSpoutRX, Verbose, TEXT("ReceiveOnce: ENTER"));
 
 	if (!SpoutDX12)
@@ -1084,10 +1422,19 @@ bool USpoutReceiverComponent::ReceiveOnce()
 		SenderName = SpoutDX12->GetSenderName();
 		if (!SenderName || !SpoutInfo || !SpoutInfo->GetSenderInfo(SenderName, SW, SH, Share, Fmt) || !Share)
 		{
-			UE_LOG(LogSpoutRX, Error, TEXT("ReceiveOnce: no valid sender/share."));
+			if (!bSourceUnavailableLogged)
+			{
+				UE_LOG(LogSpoutRX, Display, TEXT("Receiver source unavailable: '%s'; retaining prior output until it reconnects."), *SpoutSenderName);
+				bSourceUnavailableLogged = true;
+			}
 			bConnected = false;
 			++StatMissedFramesAccum;
 			return false;
+		}
+		if (bSourceUnavailableLogged)
+		{
+			UE_LOG(LogSpoutRX, Display, TEXT("Receiver source available again: '%s'."), ANSI_TO_TCHAR(SenderName));
+			bSourceUnavailableLogged = false;
 		}
 		Incoming.Width = SW;
 		Incoming.Height = SH;
@@ -1107,10 +1454,15 @@ bool USpoutReceiverComponent::ReceiveOnce()
 		// Only close/disable if we had already set up sync before, for
 		// the OLD sender name. On the very first run bSyncInitialized
 		// is false, so there is nothing yet to close.
+		if (!DrainReceiverCopies())
+		{
+			return false;
+		}
 		if (bSyncInitialized)
 		{
 			SpoutDX12->frame.CloseAccessMutex();  // close the old sender's lock
-			SpoutDX12->frame.DisableFrameCount(); // stop tracking the old sender's frame count
+			// DisableFrameCount latches counting off; EnableFrameCount does not undo it.
+			SpoutDX12->frame.CleanupFrameCount(); // disconnect only the old sender's counter
 
 			// A different sender can expose a handle with the same numeric value;
 			// invalidate by sender identity, not only by the share-handle value.
@@ -1125,15 +1477,46 @@ bool USpoutReceiverComponent::ReceiveOnce()
 		SpoutDX12->frame.EnableFrameCount(SenderName);  // start tracking its frame count (used by GetNewFrame())
 		FCStringAnsi::Strncpy(SpoutSyncName, SenderName, 256); // remember which sender we set up, to detect the next change
 		bSyncInitialized = true;                        // skip this whole block next time, unless the sender changes again
+		bNewFramePendingCopy = false;
+		ReceiverTraceObservedFrame = -1;
+		++ReceiverTraceSourceEpoch;
+		RecordReceiverTrace(TEXT("SourceSyncReset"));
 	}
 
 	// Skip if the sender has no new frame since our last read.
 	// GetNewFrame() does not block, it just checks the frame counter.
 	// We skip this check on the very first frame (bConnected == false),
 	// so the first frame is always shown.
-	if (bConnected && !SpoutDX12->frame.GetNewFrame())
+	if (bConnected || bCaptureDrivenReceiving)
 	{
-		return false;
+		if (bCaptureDrivenReceiving && !SpoutDX12->frame.IsFrameCountEnabled())
+		{
+			RecordReceiverTrace(TEXT("CaptureFrameCountUnavailable"));
+			return false;
+		}
+		// Retain an observed update across mutex/copy failures in capture-driven mode.
+		const bool bNewFrame = (bCaptureDrivenReceiving && bNewFramePendingCopy)
+			|| SpoutDX12->frame.GetNewFrame();
+		if (bReceiverTraceActive)
+		{
+			ReceiverTraceObservedFrame = SpoutDX12->frame.IsFrameCountEnabled()
+				? static_cast<int64>(SpoutDX12->frame.GetSenderFrame()) : -1;
+			RecordReceiverTrace(bNewFrame ? TEXT("NewFrame") : TEXT("NoNewFrame"));
+		}
+		if (!bNewFrame)
+		{
+			bRetryableReceiveFailure = true;
+			return false;
+		}
+		if (bCaptureDrivenReceiving)
+		{
+			bNewFramePendingCopy = true;
+		}
+	}
+	else
+	{
+		ReceiverTraceObservedFrame = -1;
+		RecordReceiverTrace(TEXT("FirstFrameUncounted"));
 	}
 
 	// Open shared DX11 texture from sender.
@@ -1202,6 +1585,10 @@ bool USpoutReceiverComponent::ReceiveOnce()
 
 	if (needRecreate)
 	{
+		if (!DrainReceiverCopies())
+		{
+			return false;
+		}
 		if (Incoming.GPUCopy11) {
 			reinterpret_cast<ID3D11Texture2D*>(Incoming.GPUCopy11)->Release();
 			Incoming.GPUCopy11 = nullptr;
@@ -1248,10 +1635,14 @@ bool USpoutReceiverComponent::ReceiveOnce()
 	//     have access. We skip this frame and try again next tick.
 	if (!SpoutDX12->frame.CheckAccess())
 	{
+		RecordReceiverTrace(TEXT("MutexMiss"));
+		bRetryableReceiveFailure = true;
 		++StatMissedFramesAccum;
 		return false;
 	}
+	RecordReceiverTrace(TEXT("MutexAcquired"));
 
+	bReceiverCopyWorkPending = true;
 	// Copy sender texture to local DX11 copy texture. This only runs
 	// while we hold the lock, so the sender cannot be writing at the
 	// same time.
@@ -1264,6 +1655,7 @@ bool USpoutReceiverComponent::ReceiveOnce()
 	// now that the copy is done. Only call this after a successful
 	// CheckAccess() — this lets the sender write its next frame.
 	SpoutDX12->frame.AllowAccess();
+	RecordReceiverTrace(TEXT("SnapshotQueuedMutexReleased"));
 
 	++StatCopyCount;
 
@@ -1305,6 +1697,7 @@ bool USpoutReceiverComponent::ReceiveOnce()
 
 	ID3D11Resource* ToAcquire[1] = { reinterpret_cast<ID3D11Resource*>(Incoming.WrappedDest11[WriteIdx]) };
 	D3D11On12->AcquireWrappedResources(ToAcquire, 1);
+	bReceiverCopyWorkPending = true;
 
 	Ctx11->CopyResource(
 		reinterpret_cast<ID3D11Resource*>(Incoming.WrappedDest11[WriteIdx]),
@@ -1329,6 +1722,7 @@ bool USpoutReceiverComponent::ReceiveOnce()
 	// only after the fence completes.
 
 	bConnected = true;
+	bNewFramePendingCopy = false;
 
 	if (bUseDoubleBuffer)
 	{
@@ -1348,6 +1742,7 @@ bool USpoutReceiverComponent::EnsureGpuRenderTarget(uint32 W, uint32 H, int32 In
 	// Invalidate cache if TargetRT object changed for this slot
 	if (CachedRTObject[Index] != TargetRT)
 	{
+		if (!DrainReceiverCopies()) return false;
 		CachedRTObject[Index] = TargetRT;
 		CachedRTRes[Index] = nullptr;
 
@@ -1362,6 +1757,7 @@ bool USpoutReceiverComponent::EnsureGpuRenderTarget(uint32 W, uint32 H, int32 In
 	bool bReinit = ((uint32)TargetRT->SizeX != W) || ((uint32)TargetRT->SizeY != H);
 	if (bReinit)
 	{
+		if (!DrainReceiverCopies()) return false;
 		const EPixelFormat NeededPF = MapDxgiToUE((DXGI_FORMAT)Incoming.Format);
 		const bool bUseLinearGamma = !IsLiveBoardSrgbVideoFormat((DXGI_FORMAT)Incoming.Format);
 
@@ -1389,6 +1785,7 @@ bool USpoutReceiverComponent::EnsureGpuRenderTarget(uint32 W, uint32 H, int32 In
 		return true;
 
 	// Re-wrap
+	if (!DrainReceiverCopies()) return false;
 	if (Incoming.WrappedDest11[Index])
 	{
 		reinterpret_cast<ID3D11Resource*>(Incoming.WrappedDest11[Index])->Release();
