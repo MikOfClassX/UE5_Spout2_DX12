@@ -1063,6 +1063,20 @@ bool USpoutReceiverComponent::ReceiveOnce()
 
 	UE_LOG(LogSpoutRX, Verbose, TEXT("ReceiveOnce: begin"));
 
+	// Apply a changed explicit sender selection without tearing down the receiver
+	// or its D3D devices. ReceiveOnce below refreshes sender-specific sync/share
+	// state and accepts the first frame from the newly selected sender.
+	if (!SpoutSenderName.IsEmpty())
+	{
+		const char* CurrentReceiverName = SpoutDX12->GetSenderName();
+		const FString CurrentName = CurrentReceiverName ? ANSI_TO_TCHAR(CurrentReceiverName) : FString();
+		if (!CurrentName.Equals(SpoutSenderName, ESearchCase::CaseSensitive))
+		{
+			SpoutDX12->SetReceiverName(TCHAR_TO_ANSI(*SpoutSenderName));
+			bConnected = false;
+		}
+	}
+
 	// Read sender info from Spout.
 	unsigned int SW = 0, SH = 0; HANDLE Share = nullptr; DWORD Fmt = 0;
 	const char* SenderName = nullptr;
@@ -1097,6 +1111,15 @@ bool USpoutReceiverComponent::ReceiveOnce()
 		{
 			SpoutDX12->frame.CloseAccessMutex();  // close the old sender's lock
 			SpoutDX12->frame.DisableFrameCount(); // stop tracking the old sender's frame count
+
+			// A different sender can expose a handle with the same numeric value;
+			// invalidate by sender identity, not only by the share-handle value.
+			if (Incoming.CachedSrc11)
+			{
+				reinterpret_cast<ID3D11Texture2D*>(Incoming.CachedSrc11)->Release();
+				Incoming.CachedSrc11 = nullptr;
+			}
+			Incoming.CachedShareHandle = nullptr;
 		}
 		SpoutDX12->frame.CreateAccessMutex(SenderName); // open the lock for the current sender
 		SpoutDX12->frame.EnableFrameCount(SenderName);  // start tracking its frame count (used by GetNewFrame())
